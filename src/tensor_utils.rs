@@ -25,6 +25,10 @@ impl RmsNorm {
 
     /// Apply RMS normalization.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        // Candle's fused kernel on the GPU, one call instead of seven.
+        if !x.device().is_cpu() && x.dtype() == self.weight.dtype() {
+            return candle_nn::ops::rms_norm(&x.contiguous()?, &self.weight, self.eps as f32);
+        }
         let dtype = x.dtype();
         let x = x.to_dtype(candle_core::DType::F32)?;
         let variance = x.sqr()?.mean_keepdim(candle_core::D::Minus1)?;
@@ -49,7 +53,13 @@ pub fn apply_rotary_emb(
 }
 
 fn apply_rotary_emb_one(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
-    let (_batch, _heads, _seq_len, head_dim) = x.dims4()?;
+    let (_batch, _heads, seq_len, head_dim) = x.dims4()?;
+    // Candle's fused kernel (half-rotation layout, as below) on the GPU.
+    if !x.device().is_cpu() && cos.dims() == [1, 1, seq_len, head_dim] {
+        let half = head_dim / 2;
+        let table = |t: &Tensor| t.squeeze(0)?.squeeze(0)?.narrow(1, 0, half)?.contiguous();
+        return candle_nn::rotary_emb::rope(&x.contiguous()?, &table(cos)?, &table(sin)?);
+    }
     let half = head_dim / 2;
     let x1 = x.narrow(candle_core::D::Minus1, 0, half)?;
     let x2 = x.narrow(candle_core::D::Minus1, half, half)?;

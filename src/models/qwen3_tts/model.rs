@@ -159,7 +159,7 @@ impl TtsModel for Qwen3TtsModel {
         info!("Input sequence shape: {:?}", full_input.shape());
 
         let (codec_tokens_g0, hidden_states) =
-            self.generate_codec_tokens(&full_input, &trailing_text_hidden, request)?;
+            self.generate_codec_tokens(&full_input, &trailing_text_hidden, request, None)?;
         let all_codes = self.assemble_all_codes(&codec_tokens_g0, &hidden_states)?;
         let samples = self.decode_to_audio(&all_codes)?;
 
@@ -170,6 +170,80 @@ impl TtsModel for Qwen3TtsModel {
         );
 
         Ok(AudioSamples::new(samples, 24000))
+    }
+
+    fn synthesize_stream(
+        &self,
+        request: &SynthesisRequest,
+        on_chunk: &mut dyn FnMut(AudioSamples) -> Result<(), TtsError>,
+    ) -> Result<(), TtsError> {
+        // The first chunk is short so that audio starts early; later ones
+        // grow, each decode having a fixed cost, once playback is covered.
+        const CHUNKS: [usize; 3] = [4, 8, 25];
+
+        self.validate_request(request)?;
+        let speech_tokenizer = self.speech_tokenizer.as_ref().ok_or_else(|| {
+            TtsError::ModelError("Qwen3-TTS: speech tokenizer not loaded".to_string())
+        })?;
+        let token_ids = self.tokenize_text(&request.text)?;
+        let instruct_token_ids = self.tokenize_instruct(request.instruct.as_deref())?;
+        let (speaker_id, language_id) = self.resolve_speaker_language(request);
+        let (full_input, trailing_text_hidden) = self.build_input_embeddings(
+            &token_ids,
+            instruct_token_ids.as_deref(),
+            speaker_id,
+            language_id,
+        )?;
+
+        let mut stream = super::speech_tokenizer::DecoderStream::new();
+        let mut pending: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut chunks = 0usize;
+        let mut failure: Option<TtsError> = None;
+        let mut decode = |frames: &[(u32, Vec<u32>)],
+                          stream: &mut super::speech_tokenizer::DecoderStream|
+         -> Result<(), TtsError> {
+            let g0: Vec<u32> = frames.iter().map(|(g0, _)| *g0).collect();
+            let groups: Vec<Vec<u32>> = frames.iter().map(|(_, groups)| groups.clone()).collect();
+            let codes = self.assemble_all_codes(&g0, &groups)?;
+            let audio = speech_tokenizer
+                .decode_chunk(&codes, stream)
+                .and_then(|audio| audio.to_dtype(candle_core::DType::F32))
+                .and_then(|audio| audio.to_vec1::<f32>())
+                .map_err(TtsError::ComputeError)?;
+            on_chunk(AudioSamples::new(audio, 24000))
+        };
+        let mut on_frame = |g0: u32, groups: &[u32]| -> candle_core::Result<()> {
+            pending.push((g0, groups.to_vec()));
+            let due = CHUNKS[chunks.min(CHUNKS.len() - 1)];
+            if pending.len() >= due {
+                if let Err(error) = decode(&pending, &mut stream) {
+                    let message = error.to_string();
+                    failure = Some(error);
+                    return Err(candle_core::Error::Msg(message));
+                }
+                chunks += 1;
+                pending.clear();
+            }
+            Ok(())
+        };
+        let generated = self.generate_codec_tokens(
+            &full_input,
+            &trailing_text_hidden,
+            request,
+            Some(&mut on_frame),
+        );
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        generated?;
+        if !pending.is_empty() {
+            decode(&pending, &mut stream)?;
+        }
+        Ok(())
+    }
+
+    fn supports_streaming(&self) -> bool {
+        self.speech_tokenizer.is_some()
     }
 
     fn sample_rate(&self) -> u32 {
@@ -589,6 +663,7 @@ impl Qwen3TtsModel {
         full_input: &Tensor,
         trailing_text_hidden: &Tensor,
         request: &SynthesisRequest,
+        mut on_frame: Option<&mut dyn FnMut(u32, &[u32]) -> candle_core::Result<()>>,
     ) -> Result<(Vec<u32>, Vec<Vec<u32>>), TtsError> {
         let max_tokens = request.max_tokens.unwrap_or(2048);
         // Default to 0.9 temperature with top-k 50 (matching reference)
@@ -608,7 +683,12 @@ impl Qwen3TtsModel {
                                   dev: &Device|
              -> candle_core::Result<(Tensor, Vec<u32>)> {
                 let mut cp = cp_mutex.lock().unwrap();
-                cp.predict_step_and_sum(past_hidden, g0_token, g0_embed, dev)
+                let out = cp.predict_step_and_sum(past_hidden, g0_token, g0_embed, dev)?;
+                drop(cp);
+                if let Some(on_frame) = on_frame.as_deref_mut() {
+                    on_frame(g0_token, &out.1)?;
+                }
+                Ok(out)
             };
             let generation_config = TalkerGenerationConfig::new(max_tokens, temperature, top_k)
                 .with_predict_and_sum_fn(&mut predict_fn);

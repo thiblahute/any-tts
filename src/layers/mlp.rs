@@ -8,14 +8,16 @@
 //! ```
 
 use candle_core::{Result, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use crate::layers::metal_ops::Linear;
+use candle_nn::{Module, VarBuilder};
 
 use crate::tensor_utils::silu;
 
 /// SiLU-gated feed-forward network.
 pub struct SiluMlp {
-    gate_proj: Linear,
-    up_proj: Linear,
+    /// gate_proj and up_proj stacked: one kernel per decoding step.
+    gate_up_proj: Linear,
+    intermediate_size: usize,
     down_proj: Linear,
 }
 
@@ -28,22 +30,24 @@ impl SiluMlp {
     /// - `down_proj.weight` — (hidden_size, intermediate_size)
     pub fn load(hidden_size: usize, intermediate_size: usize, vb: VarBuilder) -> Result<Self> {
         let gate_proj =
-            candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
-        let up_proj = candle_nn::linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
+            crate::layers::metal_ops::linear_no_bias(hidden_size, intermediate_size, vb.pp("gate_proj"))?;
+        let up_proj = crate::layers::metal_ops::linear_no_bias(hidden_size, intermediate_size, vb.pp("up_proj"))?;
         let down_proj =
-            candle_nn::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
+            crate::layers::metal_ops::linear_no_bias(intermediate_size, hidden_size, vb.pp("down_proj"))?;
 
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj: crate::layers::metal_ops::stacked(&[gate_proj, up_proj])?,
+            intermediate_size,
             down_proj,
         })
     }
 
     /// Forward pass: `down_proj( silu(gate_proj(x)) * up_proj(x) )`
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = silu(&self.gate_proj.forward(x)?)?;
-        let up = self.up_proj.forward(x)?;
+        let gate_up = self.gate_up_proj.forward(x)?;
+        let last = gate_up.rank() - 1;
+        let gate = silu(&gate_up.narrow(last, 0, self.intermediate_size)?)?;
+        let up = gate_up.narrow(last, self.intermediate_size, self.intermediate_size)?;
         self.down_proj.forward(&(gate * up)?)
     }
 }

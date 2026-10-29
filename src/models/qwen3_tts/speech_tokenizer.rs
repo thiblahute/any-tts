@@ -47,6 +47,91 @@ fn causal_pad(x: &Tensor, left: usize) -> Result<Tensor> {
     x.pad_with_zeros(2, left, 0)
 }
 
+/// What a streamed decode carries from one chunk of codes to the next, so
+/// that decoding chunk by chunk gives the same audio as decoding all at
+/// once: the tail of each causal convolution's input, the overlap of each
+/// transposed convolution, and the pre-transformer's recent keys and values.
+#[derive(Debug, Default)]
+pub struct DecoderStream {
+    tails: Vec<Tensor>,
+    overflows: Vec<Tensor>,
+    kv: Vec<(Tensor, Tensor)>,
+    /// Frames decoded so far: the next chunk's first position.
+    frames: usize,
+    tail_index: usize,
+    overflow_index: usize,
+}
+
+impl DecoderStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// [`causal_pad`], or in a stream the previous chunk's last `left` inputs.
+fn stream_pad(x: &Tensor, left: usize, stream: Option<&mut DecoderStream>) -> Result<Tensor> {
+    let Some(stream) = stream else {
+        return causal_pad(x, left);
+    };
+    if left == 0 {
+        return Ok(x.clone());
+    }
+    let index = stream.tail_index;
+    stream.tail_index += 1;
+    let padded = match stream.tails.get(index) {
+        Some(tail) => Tensor::cat(&[tail, x], 2)?,
+        None => causal_pad(x, left)?,
+    };
+    let len = padded.dim(2)?;
+    let tail = padded.narrow(2, len - left, left)?.contiguous()?;
+    if index < stream.tails.len() {
+        stream.tails[index] = tail;
+    } else {
+        stream.tails.push(tail);
+    }
+    Ok(padded)
+}
+
+/// Trims a causal transposed convolution's right overhang; in a stream, the
+/// overhang (without its bias, which the next chunk's head already has) is
+/// added to the next chunk's head instead of being dropped.
+fn stream_overlap(
+    y: Tensor,
+    trim: usize,
+    bias: Option<&Tensor>,
+    stream: Option<&mut DecoderStream>,
+) -> Result<Tensor> {
+    if trim == 0 {
+        return Ok(y);
+    }
+    let Some(stream) = stream else {
+        let len = y.dim(2)?;
+        return y.narrow(2, 0, len - trim);
+    };
+    let index = stream.overflow_index;
+    stream.overflow_index += 1;
+    let y = match stream.overflows.get(index) {
+        Some(overflow) => {
+            let len = y.dim(2)?;
+            let head = (y.narrow(2, 0, trim)? + overflow)?;
+            Tensor::cat(&[&head, &y.narrow(2, trim, len - trim)?], 2)?
+        }
+        None => y,
+    };
+    let len = y.dim(2)?;
+    let mut tail = y.narrow(2, len - trim, trim)?;
+    if let Some(bias) = bias {
+        tail = tail.broadcast_sub(&bias.reshape((1, bias.dim(0)?, 1))?)?;
+    }
+    let tail = tail.contiguous()?;
+    if index < stream.overflows.len() {
+        stream.overflows[index] = tail;
+    } else {
+        stream.overflows.push(tail);
+    }
+    y.narrow(2, 0, len - trim)
+}
+
 /// Configuration for the speech tokenizer decoder.
 #[derive(Debug, Clone)]
 pub struct SpeechTokenizerConfig {
@@ -273,7 +358,9 @@ impl PreTransformerLayer {
         rope_cos: &Tensor,
         rope_sin: &Tensor,
         causal_mask: &Tensor,
-    ) -> Result<Tensor> {
+        offset: usize,
+        past: Option<&(Tensor, Tensor)>,
+    ) -> Result<(Tensor, (Tensor, Tensor))> {
         let (batch, seq_len, _) = x.dims3()?;
 
         // Self-attention with pre-norm
@@ -298,14 +385,21 @@ impl PreTransformerLayer {
             .contiguous()?;
 
         // Apply RoPE to Q and K
-        let cos_slice = rope_cos.narrow(0, 0, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
-        let sin_slice = rope_sin.narrow(0, 0, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
+        let cos_slice = rope_cos.narrow(0, offset, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
+        let sin_slice = rope_sin.narrow(0, offset, seq_len)?.unsqueeze(0)?.unsqueeze(0)?;
         let (q, k) = apply_rotary_emb(&q, &k, &cos_slice, &sin_slice)?;
+        let (k, v) = match past {
+            Some((past_k, past_v)) => (Tensor::cat(&[past_k, &k], 2)?, Tensor::cat(&[past_v, &v], 2)?),
+            None => (k, v),
+        };
 
         let scale = 1.0f32 / (self.head_dim as f32).sqrt();
-        let out = if let Some(cpu_attn_out) =
+        let cpu_attention = if past.is_none() {
             cpu_flash_attention(&q, &k, &v, Some(causal_mask), scale)?
-        {
+        } else {
+            None
+        };
+        let out = if let Some(cpu_attn_out) = cpu_attention {
             cpu_attn_out
         } else {
             let attn = q.matmul(&k.transpose(2, 3)?)?.affine(scale as f64, 0.0)?;
@@ -331,7 +425,7 @@ impl PreTransformerLayer {
         let h = self.down_proj.forward(&(gate * up)?)?;
 
         let scale = self.mlp_layer_scale.unsqueeze(0)?.unsqueeze(0)?;
-        residual + h.broadcast_mul(&scale)?
+        Ok(((residual + h.broadcast_mul(&scale)?)?, (k, v)))
     }
 }
 
@@ -397,20 +491,30 @@ impl PreTransformer {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, mut stream: Option<&mut DecoderStream>) -> Result<Tensor> {
         // x: (batch, channels, seq_len)
         // Transpose to (batch, seq_len, channels) for transformer
         let h = x.transpose(1, 2)?;
         let h = self.input_proj.forward(&h)?;
         let seq_len = h.dim(1)?;
 
-        // Build causal mask: (1, 1, seq_len, seq_len) with 0 for valid, -inf for future
-        // Also applies sliding window of 72 (from config).
+        // Sliding window of 72 (from config): what attention can see. In a
+        // stream, the previous chunks' last positions are kept for it.
         let sliding_window: usize = 72;
+        let (offset, past_len) = match stream.as_deref() {
+            Some(stream) => (
+                stream.frames,
+                stream.kv.first().map(|(k, _)| k.dim(2)).transpose()?.unwrap_or(0),
+            ),
+            None => (0, 0),
+        };
+        let keys = past_len + seq_len;
+        // Causal mask: (1, 1, seq_len, keys) with 0 for valid, -inf otherwise.
         let mask_data: Vec<f32> = (0..seq_len)
             .flat_map(|i| {
-                (0..seq_len).map(move |j| {
-                    if j <= i && i - j < sliding_window {
+                (0..keys).map(move |j| {
+                    let (query, key) = (past_len + i, j);
+                    if key <= query && query - key < sliding_window {
                         0.0f32
                     } else {
                         f32::NEG_INFINITY
@@ -418,12 +522,34 @@ impl PreTransformer {
                 })
             })
             .collect();
-        let causal_mask = Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), h.device())?
+        let causal_mask = Tensor::from_vec(mask_data, (1, 1, seq_len, keys), h.device())?
             .to_dtype(h.dtype())?;
 
         let mut h = h;
-        for layer in &self.layers {
-            h = layer.forward(&h, &self.rope_cos, &self.rope_sin, &causal_mask)?;
+        for (index, layer) in self.layers.iter().enumerate() {
+            let past = stream.as_ref().and_then(|stream| stream.kv.get(index).cloned());
+            let (out, (k, v)) = layer.forward(
+                &h,
+                &self.rope_cos,
+                &self.rope_sin,
+                &causal_mask,
+                offset,
+                past.as_ref(),
+            )?;
+            h = out;
+            if let Some(stream) = stream.as_deref_mut() {
+                let len = k.dim(2)?;
+                let keep = len.min(sliding_window - 1);
+                let kept = (
+                    k.narrow(2, len - keep, keep)?.contiguous()?,
+                    v.narrow(2, len - keep, keep)?.contiguous()?,
+                );
+                if index < stream.kv.len() {
+                    stream.kv[index] = kept;
+                } else {
+                    stream.kv.push(kept);
+                }
+            }
         }
         let h = self.norm.forward(&h)?;
         let h = self.output_proj.forward(&h)?;
@@ -474,10 +600,10 @@ impl ConvNeXtBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, stream: Option<&mut DecoderStream>) -> Result<Tensor> {
         let residual = x;
         // Causal left-pad for depthwise conv (kernel=7, left_pad=6)
-        let h = self.dwconv.forward(&causal_pad(x, 6)?)?;
+        let h = depthwise_conv(&stream_pad(x, 6, stream)?, &self.dwconv)?;
         // Layer norm over channels: transpose → normalize → transpose
         let h = h.transpose(1, 2)?; // (batch, seq, ch)
                                     // Manual LayerNorm
@@ -495,6 +621,24 @@ impl ConvNeXtBlock {
         let h = h.broadcast_mul(&gamma)?;
         let h = h.transpose(1, 2)?; // back to (batch, ch, seq)
         residual + &h
+    }
+}
+
+/// A depthwise convolution (one filter per channel, no padding) as shifted
+/// multiply-adds: Candle runs grouped convolutions one group at a time,
+/// which is a GPU call per channel.
+fn depthwise_conv(x: &Tensor, conv: &Conv1d) -> Result<Tensor> {
+    let weight = conv.weight(); // (channels, 1, kernel)
+    let (channels, _, kernel) = weight.dims3()?;
+    let out_len = x.dim(2)? + 1 - kernel;
+    let weight = weight.reshape((1, channels, kernel))?;
+    let mut out = (x.narrow(2, 0, out_len)?.broadcast_mul(&weight.narrow(2, 0, 1)?))?;
+    for k in 1..kernel {
+        out = (out + x.narrow(2, k, out_len)?.broadcast_mul(&weight.narrow(2, k, 1)?)?)?;
+    }
+    match conv.bias() {
+        Some(bias) => out.broadcast_add(&bias.reshape((1, channels, 1))?),
+        None => Ok(out),
     }
 }
 
@@ -523,9 +667,10 @@ impl UpsampleStage {
         Ok(Self { conv, convnext })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, stream: Option<&mut DecoderStream>) -> Result<Tensor> {
+        // kernel = stride: no overlap between chunks.
         let h = self.conv.forward(x)?;
-        self.convnext.forward(&h)
+        self.convnext.forward(&h, stream)
     }
 }
 
@@ -581,12 +726,12 @@ impl SnacResBlock {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, stream: Option<&mut DecoderStream>) -> Result<Tensor> {
         let alpha1 = self.act1_alpha.unsqueeze(0)?.unsqueeze(2)?;
         let beta1 = self.act1_beta.unsqueeze(0)?.unsqueeze(2)?;
         let h = snake_beta(x, &alpha1, &beta1)?;
         // Causal left-pad for dilated conv1
-        let h = self.conv1.forward(&causal_pad(&h, self.conv1_left_pad)?)?;
+        let h = self.conv1.forward(&stream_pad(&h, self.conv1_left_pad, stream)?)?;
         let alpha2 = self.act2_alpha.unsqueeze(0)?.unsqueeze(2)?;
         let beta2 = self.act2_beta.unsqueeze(0)?.unsqueeze(2)?;
         let h = snake_beta(&h, &alpha2, &beta2)?;
@@ -653,21 +798,23 @@ impl DecoderStage {
         })
     }
 
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+    fn forward(&self, x: &Tensor, mut stream: Option<&mut DecoderStream>) -> Result<Tensor> {
         let alpha = self.snake_alpha_param.unsqueeze(0)?.unsqueeze(2)?;
         let beta = self.snake_beta_param.unsqueeze(0)?.unsqueeze(2)?;
         let h = snake_beta(x, &alpha, &beta)?;
-        let mut h = self.upsample_conv.forward(&h)?;
+        let h = self.upsample_conv.forward(&h)?;
         // Trim right side for causal ConvTranspose1d
         let kernel_size = self.upsample_conv.weight().dim(2)?;
         let stride = kernel_size / 2;
         let right_pad = kernel_size - stride;
-        if right_pad > 0 {
-            let out_len = h.dim(2)?;
-            h = h.narrow(2, 0, out_len - right_pad)?;
-        }
+        let mut h = stream_overlap(
+            h,
+            right_pad,
+            self.upsample_conv.bias(),
+            stream.as_deref_mut(),
+        )?;
         for block in &self.res_blocks {
-            h = block.forward(&h)?;
+            h = block.forward(&h, stream.as_deref_mut())?;
         }
         Ok(h)
     }
@@ -817,7 +964,18 @@ impl SpeechTokenizerDecoder {
     ///
     /// Returns a 1-D f32 tensor of audio samples in `[-1, 1]`.
     pub fn decode(&self, tokens: &Tensor) -> Result<Tensor> {
-        let (batch, num_groups, _seq_len) = tokens.dims3()?;
+        self.decode_with(tokens, None)
+    }
+
+    /// Decode the next chunk of a stream: `tokens` holds only the new
+    /// frames, and the audio returned is theirs, continuing the previous
+    /// chunks' exactly. Start each stream with a new [`DecoderStream`].
+    pub fn decode_chunk(&self, tokens: &Tensor, stream: &mut DecoderStream) -> Result<Tensor> {
+        self.decode_with(tokens, Some(stream))
+    }
+
+    fn decode_with(&self, tokens: &Tensor, mut stream: Option<&mut DecoderStream>) -> Result<Tensor> {
+        let (batch, num_groups, seq_len) = tokens.dims3()?;
         assert_eq!(
             num_groups, self.config.num_groups,
             "expected {} groups, got {}",
@@ -834,29 +992,40 @@ impl SpeechTokenizerDecoder {
         let h = (&first_features + &rest_features)?; // (batch, 512, seq_len)
 
         // ── 2. Pre-conv (causal: left-pad 2) ──────────────────────────
-        let h = self.pre_conv.forward(&causal_pad(&h, 2)?)?; // (batch, 1024, seq_len)
+        let h = self
+            .pre_conv
+            .forward(&stream_pad(&h, 2, stream.as_deref_mut())?)?; // (batch, 1024, seq_len)
 
         // ── 3. Pre-transformer ────────────────────────────────────────
-        let h = self.pre_transformer.forward(&h)?;
+        let h = self.pre_transformer.forward(&h, stream.as_deref_mut())?;
 
         // ── 4. Upsample stages ────────────────────────────────────────
         let mut h = h;
         for stage in &self.upsample_stages {
-            h = stage.forward(&h)?; // 2× each → 4× total
+            h = stage.forward(&h, stream.as_deref_mut())?; // 2× each → 4× total
         }
 
         // ── 5. Decoder sequential (init conv: causal left-pad 6) ──────
-        h = self.decoder_init_conv.forward(&causal_pad(&h, 6)?)?;
+        h = self
+            .decoder_init_conv
+            .forward(&stream_pad(&h, 6, stream.as_deref_mut())?)?;
 
         for stage in &self.decoder_stages {
-            h = stage.forward(&h)?;
+            h = stage.forward(&h, stream.as_deref_mut())?;
         }
 
         // ── 6. Final activation + conv (causal left-pad 6) ─────────────
         let alpha = self.final_snake_alpha.unsqueeze(0)?.unsqueeze(2)?;
         let beta = self.final_snake_beta.unsqueeze(0)?.unsqueeze(2)?;
         let h = snake_beta(&h, &alpha, &beta)?;
-        let h = self.final_conv.forward(&causal_pad(&h, 6)?)?; // (batch, 1, samples)
+        let h = self
+            .final_conv
+            .forward(&stream_pad(&h, 6, stream.as_deref_mut())?)?; // (batch, 1, samples)
+        if let Some(stream) = stream {
+            stream.frames += seq_len;
+            stream.tail_index = 0;
+            stream.overflow_index = 0;
+        }
 
         // ── 7. clamp to [-1, 1] (matches reference: .clamp(min=-1, max=1)) ─
         let h = h.clamp(-1f32, 1f32)?;

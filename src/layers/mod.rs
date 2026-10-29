@@ -17,3 +17,4 @@ pub use conv::{AdaIn1d, AdaLayerNorm, Conv1d, ConvTranspose1d, InstanceNorm1d, L
 pub use lstm::Lstm;
 pub use mlp::SiluMlp;
 pub use transformer::TransformerBlock;
+pub mod metal_ops;

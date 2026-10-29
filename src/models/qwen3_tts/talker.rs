@@ -11,7 +11,8 @@
 //! ```
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Linear, Module, VarBuilder};
+use crate::layers::metal_ops::Linear;
+use candle_nn::{Embedding, Module, VarBuilder};
 
 use crate::layers::attention::GqaConfig;
 use crate::layers::transformer::TransformerBlock;
@@ -109,12 +110,12 @@ impl TalkerLm {
         )?;
 
         // Text projection MLP — weights under `talker.text_projection.*`
-        let text_proj_fc1 = candle_nn::linear(
+        let text_proj_fc1 = crate::layers::metal_ops::linear(
             config.text_hidden_size,
             config.hidden_size,
             vb.pp("text_projection.linear_fc1"),
         )?;
-        let text_proj_fc2 = candle_nn::linear(
+        let text_proj_fc2 = crate::layers::metal_ops::linear(
             config.hidden_size,
             config.hidden_size,
             vb.pp("text_projection.linear_fc2"),
@@ -136,7 +137,7 @@ impl TalkerLm {
 
         // Codec prediction head
         let codec_head =
-            candle_nn::linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("codec_head"))?;
+            crate::layers::metal_ops::linear_no_bias(config.hidden_size, config.vocab_size, vb.pp("codec_head"))?;
 
         // Precompute RoPE
         let (rope_cos, rope_sin) = precompute_rope_freqs(

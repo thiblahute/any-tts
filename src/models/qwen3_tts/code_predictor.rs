@@ -12,13 +12,18 @@
 //! ```
 
 use candle_core::{DType, Device, IndexOp, Result, Tensor};
-use candle_nn::{Embedding, Linear, Module, VarBuilder};
+use crate::layers::metal_ops::Linear;
+use candle_nn::{Embedding, Module, VarBuilder};
 
 use crate::layers::attention::GqaConfig;
 use crate::layers::transformer::TransformerBlock;
 use crate::tensor_utils::{precompute_rope_freqs, RmsNorm};
 
 use super::config::CodePredictorConfig;
+
+/// Code predictor sampling, from the generation_config.json of the model
+/// (subtalker_temperature; subtalker_top_k is 50 and subtalker_top_p 1.0).
+const SUBTALKER_TEMPERATURE: f64 = 0.9;
 
 /// The Code Predictor sub-model.
 pub struct CodePredictor {
@@ -66,7 +71,7 @@ impl CodePredictor {
 
         // Projection from Talker hidden → Code Predictor hidden
         // Actual name: talker.code_predictor.small_to_mtp_projection.{weight,bias}
-        let input_proj = candle_nn::linear(
+        let input_proj = crate::layers::metal_ops::linear(
             talker_hidden_size,
             config.hidden_size,
             vb.pp("small_to_mtp_projection"),
@@ -105,7 +110,7 @@ impl CodePredictor {
         // Per-group heads: talker.code_predictor.lm_head.N.weight
         let mut group_heads = Vec::with_capacity(num_extra_groups);
         for g in 0..num_extra_groups {
-            let head = candle_nn::linear_no_bias(
+            let head = crate::layers::metal_ops::linear_no_bias(
                 config.hidden_size,
                 config.vocab_size,
                 vb.pp(format!("lm_head.{}", g)),
@@ -203,11 +208,14 @@ impl CodePredictor {
         // Predict group 1 from last position
         let last_h = hidden.i((.., hidden.dims()[1] - 1.., ..))?; // (1, 1, cp_hidden)
         let logits = self.group_heads[0].forward(&last_h)?;
-        let mut prev_predicted_token = sample_top_k_top_p(&logits, 50, 0.8, device)?;
-        predicted_tokens.push(prev_predicted_token);
+        // Sampled on the GPU: the code stays there as the next step's input,
+        // and the frame's codes reach the CPU once, at its end.
+        let mut prev_predicted_token = sample_top_k_top_p_gpu(&logits, SUBTALKER_TEMPERATURE, 50, 1.0)?; // (1,) u32
+        let mut predicted: Vec<Tensor> = Vec::with_capacity(num_extra_groups);
+        predicted.push(prev_predicted_token.clone());
 
         // Embed predicted group-1 token and add to sum
-        let tok_tensor = Tensor::new(&[prev_predicted_token], device)?.unsqueeze(0)?;
+        let tok_tensor = prev_predicted_token.unsqueeze(0)?;
         let tok_embed = self.group_embeds[0].forward(&tok_tensor)?; // (1, 1, talker_hidden)
         summed = summed.add(&tok_embed)?;
 
@@ -215,7 +223,7 @@ impl CodePredictor {
         for gen_step in 1..num_extra_groups {
             let pos = gen_step + 1; // Two prefill positions, then one per group.
                                     // Embed the previous step's predicted token using its group embedding
-            let prev_tok_tensor = Tensor::new(&[prev_predicted_token], device)?.unsqueeze(0)?;
+            let prev_tok_tensor = prev_predicted_token.unsqueeze(0)?;
             let embed_idx = (gen_step - 1).min(self.group_embeds.len() - 1);
             let prev_embed = self.group_embeds[embed_idx].forward(&prev_tok_tensor)?;
 
@@ -228,11 +236,11 @@ impl CodePredictor {
             let h = self.norm.forward(&h)?;
 
             let logits = self.group_heads[gen_step].forward(&h)?;
-            let predicted_token = sample_top_k_top_p(&logits, 50, 0.8, device)?;
-            predicted_tokens.push(predicted_token);
+            let predicted_token = sample_top_k_top_p_gpu(&logits, SUBTALKER_TEMPERATURE, 50, 1.0)?;
+            predicted.push(predicted_token.clone());
 
             // Embed and add to sum
-            let pred_tensor = Tensor::new(&[predicted_token], device)?.unsqueeze(0)?;
+            let pred_tensor = predicted_token.unsqueeze(0)?;
             let pred_embed_idx = gen_step.min(self.group_embeds.len() - 1);
             let pred_embed = self.group_embeds[pred_embed_idx].forward(&pred_tensor)?;
             summed = summed.add(&pred_embed)?;
@@ -245,6 +253,7 @@ impl CodePredictor {
             layer.clear_cache();
         }
 
+        predicted_tokens.extend(Tensor::cat(&predicted, 0)?.to_vec1::<u32>()?);
         Ok((summed, predicted_tokens))
     }
 }
@@ -259,56 +268,62 @@ impl std::fmt::Debug for CodePredictor {
     }
 }
 
-/// Sample a token from logits using top-k + top-p (nucleus) filtering.
+/// Top-k then top-p sampling done entirely on the logits' device: returns
+/// the chosen token id as a (1,) u32 tensor, with no copy to the CPU. With
+/// top_p 1.0 (the reference setting) on Metal it is one fused kernel;
+/// otherwise the draw is Gumbel-max over the kept probabilities.
 ///
-/// Reference: code predictor uses do_sample=True, top_k=50, top_p=0.8.
-fn sample_top_k_top_p(logits: &Tensor, top_k: usize, top_p: f32, _device: &Device) -> Result<u32> {
-    let mut values = logits
-        .to_dtype(candle_core::DType::F32)?
-        .flatten_all()?
-        .to_vec1::<f32>()?;
-    super::sampling::sample_logits(&mut values, 1.0, top_k, top_p, cp_rand_uniform())
-}
-
-/// Simple random float in [0, 1) for code predictor sampling.
-fn cp_rand_uniform() -> f32 {
-    use std::sync::Mutex;
-    use std::time::SystemTime;
-
-    static STATE: Mutex<Option<[u64; 4]>> = Mutex::new(None);
-
-    let mut guard = STATE.lock().unwrap();
-    let s = guard.get_or_insert_with(|| {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
+/// Candle's Metal sort is wrong for rows over 1024 values, so the top k is
+/// taken in two stages: per block of 1024, then among those candidates.
+fn sample_top_k_top_p_gpu(
+    logits: &Tensor,
+    temperature: f64,
+    top_k: usize,
+    top_p: f32,
+) -> Result<Tensor> {
+    // One fused kernel for the reference settings (top_p 1.0).
+    #[cfg(feature = "metal")]
+    if top_p >= 1.0 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static DRAWS: AtomicU64 = AtomicU64::new(0);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0xcafebabe);
-        let mut seed = [
-            now ^ 0xabcdef0123456789,
-            now.wrapping_mul(6364136223846793005),
-            !now ^ 0x9876543210fedcba,
-            now.rotate_left(17) ^ 0x1111111111111111,
-        ];
-        for _ in 0..8 {
-            let t = seed[1] << 17;
-            seed[2] ^= seed[0];
-            seed[3] ^= seed[1];
-            seed[1] ^= seed[2];
-            seed[0] ^= seed[3];
-            seed[2] ^= t;
-            seed[3] = seed[3].rotate_left(45);
+            .unwrap_or(0)
+            .wrapping_add(DRAWS.fetch_add(1, Ordering::Relaxed).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        if let Some(token) = crate::layers::metal_ops::sample_top_k(logits, top_k, temperature, seed)? {
+            return Ok(token);
         }
-        seed
-    });
-
-    let result = (s[0].wrapping_add(s[3])).rotate_left(23).wrapping_add(s[0]);
-    let t = s[1] << 17;
-    s[2] ^= s[0];
-    s[3] ^= s[1];
-    s[1] ^= s[2];
-    s[0] ^= s[3];
-    s[2] ^= t;
-    s[3] = s[3].rotate_left(45);
-
-    (result >> 40) as f32 / (1u64 << 24) as f32
+    }
+    const BLOCK: usize = 1024;
+    let device = logits.device();
+    let logits = (logits.to_dtype(DType::F32)?.flatten_all()? / temperature)?;
+    let vocab = logits.dims1()?;
+    let blocks = vocab.div_ceil(BLOCK);
+    let logits = if vocab % BLOCK == 0 {
+        logits
+    } else {
+        let pad = Tensor::full(f32::NEG_INFINITY, blocks * BLOCK - vocab, device)?;
+        Tensor::cat(&[&logits, &pad], 0)?
+    };
+    let k = top_k.min(BLOCK).min(vocab);
+    let (values, order) = logits.reshape((blocks, BLOCK))?.sort_last_dim(false)?;
+    let values = values.narrow(1, 0, k)?.flatten_all()?;
+    let offsets: Vec<u32> = (0..blocks).map(|b| (b * BLOCK) as u32).collect();
+    let offsets = Tensor::new(offsets.as_slice(), device)?.unsqueeze(1)?;
+    let ids = order.narrow(1, 0, k)?.broadcast_add(&offsets)?.flatten_all()?;
+    let (sorted, pick) = values.sort_last_dim(false)?;
+    let sorted = sorted.narrow(0, 0, k)?;
+    let ids = ids.gather(&pick.narrow(0, 0, k)?.contiguous()?, 0)?;
+    let probs = candle_nn::ops::softmax_last_dim(&sorted)?;
+    // Keep the smallest prefix whose mass reaches top_p (the first always).
+    let before = (probs.cumsum(0)? - &probs)?;
+    let keep = before.lt(top_p as f64)?.to_dtype(DType::F32)?;
+    let uniform = Tensor::rand(1e-6f32, 1.0f32, k, device)?;
+    let gumbel = uniform.log()?.neg()?.log()?.neg()?;
+    // Excluded codes are pushed far down rather than given log(0).
+    let excluded = ((keep.neg()? + 1.0)? * 1e9)?;
+    let scores = ((probs.log()? + gumbel)? - excluded)?;
+    let chosen = scores.argmax(0)?.unsqueeze(0)?; // (1,) u32
+    ids.gather(&chosen, 0)
 }

@@ -5,7 +5,8 @@
 //! across multiple query heads.
 
 use candle_core::{Result, Tensor};
-use candle_nn::{Linear, Module, VarBuilder};
+use crate::layers::metal_ops::Linear;
+use candle_nn::{Module, VarBuilder};
 
 use super::kv_cache::{KvCache, KvCacheState};
 use crate::tensor_utils::{apply_rotary_emb, cpu_flash_attention, RmsNorm};
@@ -76,9 +77,8 @@ impl GqaConfig {
 
 /// Grouped-Query Attention with rotary position embeddings.
 pub struct GroupedQueryAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    /// q_proj, k_proj and v_proj stacked: one kernel per decoding step.
+    qkv_proj: Linear,
     o_proj: Linear,
     q_norm: Option<RmsNorm>,
     k_norm: Option<RmsNorm>,
@@ -101,30 +101,30 @@ impl GroupedQueryAttention {
         let kv_dim = config.num_key_value_heads * config.head_dim;
 
         let q_proj = if config.attention_bias {
-            candle_nn::linear(config.hidden_size, q_dim, vb.pp("q_proj"))?
+            crate::layers::metal_ops::linear(config.hidden_size, q_dim, vb.pp("q_proj"))?
         } else {
-            candle_nn::linear_no_bias(config.hidden_size, q_dim, vb.pp("q_proj"))?
+            crate::layers::metal_ops::linear_no_bias(config.hidden_size, q_dim, vb.pp("q_proj"))?
         };
         let k_proj = if config.attention_bias {
-            candle_nn::linear(config.hidden_size, kv_dim, vb.pp("k_proj"))?
+            crate::layers::metal_ops::linear(config.hidden_size, kv_dim, vb.pp("k_proj"))?
         } else {
-            candle_nn::linear_no_bias(config.hidden_size, kv_dim, vb.pp("k_proj"))?
+            crate::layers::metal_ops::linear_no_bias(config.hidden_size, kv_dim, vb.pp("k_proj"))?
         };
         let v_proj = if config.attention_bias {
-            candle_nn::linear(config.hidden_size, kv_dim, vb.pp("v_proj"))?
+            crate::layers::metal_ops::linear(config.hidden_size, kv_dim, vb.pp("v_proj"))?
         } else {
-            candle_nn::linear_no_bias(config.hidden_size, kv_dim, vb.pp("v_proj"))?
+            crate::layers::metal_ops::linear_no_bias(config.hidden_size, kv_dim, vb.pp("v_proj"))?
         };
-        let o_proj = candle_nn::linear_no_bias(q_dim, config.hidden_size, vb.pp("o_proj"))?;
+        let o_proj = crate::layers::metal_ops::linear_no_bias(q_dim, config.hidden_size, vb.pp("o_proj"))?;
 
         // Qwen3 models have per-head QK-norm; Qwen2 models do not.
         let q_norm = RmsNorm::load(config.head_dim, config.rms_norm_eps, vb.pp("q_norm")).ok();
         let k_norm = RmsNorm::load(config.head_dim, config.rms_norm_eps, vb.pp("k_norm")).ok();
 
+        let qkv_proj = crate::layers::metal_ops::stacked(&[q_proj, k_proj, v_proj])?;
+
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm,
             k_norm,
@@ -159,9 +159,12 @@ impl GroupedQueryAttention {
         }
 
         // Project Q, K, V
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        let q_dim = self.num_heads * self.head_dim;
+        let kv_dim = self.num_kv_heads * self.head_dim;
+        let qkv = self.qkv_proj.forward(x)?;
+        let q = qkv.narrow(2, 0, q_dim)?.contiguous()?;
+        let k = qkv.narrow(2, q_dim, kv_dim)?.contiguous()?;
+        let v = qkv.narrow(2, q_dim + kv_dim, kv_dim)?.contiguous()?;
 
         // Reshape to (batch, heads, seq_len, head_dim)
         let q = q
