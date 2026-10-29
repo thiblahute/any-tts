@@ -35,6 +35,10 @@ const VOICE_EXPORT_HINT: &str = "export the voice with scripts/qwen3_tts_voice.p
 const ICL_REPETITION_PENALTY: f32 = 1.5;
 const ICL_REPETITION_WINDOW: usize = 64;
 
+/// How many cloned voices stay prepared, so that a caller switching between
+/// a few (one per language, say) does not prepare them again each time.
+const PREPARED_VOICES: usize = 4;
+
 /// A cloned voice, prepared once and reused for each sentence.
 struct PreparedVoice {
     key: u64,
@@ -81,8 +85,8 @@ pub struct Qwen3TtsModel {
     /// Wrapped in Mutex for interior mutability (KV-cache updates during prediction).
     code_predictor: Option<Mutex<CodePredictor>>,
     speech_tokenizer: Option<SpeechTokenizerDecoder>,
-    /// The last cloned voice used, prepared.
-    voice: Mutex<Option<Arc<PreparedVoice>>>,
+    /// The last cloned voices used, prepared, the most recent last.
+    voices: Mutex<Vec<Arc<PreparedVoice>>>,
 }
 
 impl TtsModel for Qwen3TtsModel {
@@ -192,7 +196,7 @@ impl TtsModel for Qwen3TtsModel {
             talker: Mutex::new(talker),
             code_predictor: code_predictor.map(Mutex::new),
             speech_tokenizer,
-            voice: Mutex::new(None),
+            voices: Mutex::new(Vec::new()),
         })
     }
 
@@ -377,8 +381,8 @@ impl Qwen3TtsModel {
         )
     }
 
-    /// The request's cloned voice, prepared: from the cache when it is the
-    /// voice of the previous request, else computed once here.
+    /// The request's cloned voice, prepared: from the cache when it is one
+    /// of the last voices used, else computed once here.
     fn prepare_voice(
         &self,
         request: &SynthesisRequest,
@@ -387,9 +391,12 @@ impl Qwen3TtsModel {
             return Ok(None);
         };
         let key = voice_key(embedding);
-        if let Some(voice) = self.voice.lock().unwrap().as_ref() {
-            if voice.key == key {
-                return Ok(Some(voice.clone()));
+        {
+            let mut voices = self.voices.lock().unwrap();
+            if let Some(index) = voices.iter().position(|voice| voice.key == key) {
+                let voice = voices.remove(index);
+                voices.push(voice.clone());
+                return Ok(Some(voice));
             }
         }
 
@@ -411,7 +418,11 @@ impl Qwen3TtsModel {
             None => None,
         };
         let voice = Arc::new(PreparedVoice { key, speaker, icl });
-        *self.voice.lock().unwrap() = Some(voice.clone());
+        let mut voices = self.voices.lock().unwrap();
+        if voices.len() == PREPARED_VOICES {
+            voices.remove(0);
+        }
+        voices.push(voice.clone());
         Ok(Some(voice))
     }
 
