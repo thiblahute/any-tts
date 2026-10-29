@@ -413,12 +413,16 @@ impl ModelFiles {
             }
         }
 
-        // tokenizer.json
+        // tokenizer.json, or vocab.json with merges.txt (Qwen3-TTS ships those)
         if self.tokenizer.is_none() {
             let p = dir.join("tokenizer.json");
+            let vocab = dir.join("vocab.json");
             if p.exists() {
                 info!("Auto-discovered tokenizer: {}", p.display());
                 self.tokenizer = Some(ModelAsset::from_path(p));
+            } else if vocab.exists() && dir.join("merges.txt").exists() {
+                info!("Auto-discovered tokenizer: {}", vocab.display());
+                self.tokenizer = Some(ModelAsset::from_path(vocab));
             } else {
                 let p = dir.join("tekken.json");
                 if p.exists() {
