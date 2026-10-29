@@ -30,6 +30,7 @@ use candle_nn::{
     Conv1d, Conv1dConfig, ConvTranspose1d, ConvTranspose1dConfig, Linear, Module, VarBuilder,
 };
 
+use crate::layers::metal_conv::{depthwise_conv1d, MetalConv, Snake};
 use crate::tensor_utils::{
     apply_rotary_emb, cpu_flash_attention, precompute_rope_freqs, snake_beta,
 };
@@ -50,9 +51,10 @@ fn causal_pad(x: &Tensor, left: usize) -> Result<Tensor> {
 /// What a streamed decode carries from one chunk of codes to the next, so
 /// that decoding chunk by chunk gives the same audio as decoding all at
 /// once: the tail of each causal convolution's input, the overlap of each
-/// transposed convolution, and the pre-transformer's recent keys and values.
-/// Cloning a stream forks it: a stream primed with a voice's reference
-/// codes can start each sentence's decode where the reference ended.
+/// transposed convolution (on Metal, its last input instead), and the
+/// pre-transformer's recent keys and values. Cloning a stream forks it: a
+/// stream primed with a voice's reference codes can start each sentence's
+/// decode where the reference ended.
 #[derive(Debug, Default, Clone)]
 pub struct DecoderStream {
     tails: Vec<Tensor>,
@@ -139,6 +141,14 @@ fn stream_overlap(
     y.narrow(2, 0, len - trim)
 }
 
+/// `conv` on `x`, through the Metal kernel when there is one for both.
+fn conv_forward(conv: &Conv1d, metal: Option<&MetalConv>, x: &Tensor) -> Result<Tensor> {
+    match metal.filter(|metal| metal.supports(x)) {
+        Some(metal) => metal.forward(x, None, None),
+        None => conv.forward(x),
+    }
+}
+
 /// Configuration for the speech tokenizer decoder.
 #[derive(Debug, Clone)]
 pub struct SpeechTokenizerConfig {
@@ -200,11 +210,9 @@ impl Default for SpeechTokenizerConfig {
 
 /// A single VQ codebook using EMA-style embedding_sum weights.
 struct VqCodebook {
-    /// Codebook embeddings (from `_codebook.embedding_sum`).
-    /// Shape: (codebook_size, vq_embed_dim).
+    /// Codebook embeddings (from `_codebook.embedding_sum`), normalized by
+    /// cluster usage. Shape: (codebook_size, vq_embed_dim).
     embeddings: Tensor,
-    /// Cluster usage counts for normalization.
-    cluster_usage: Tensor,
 }
 
 impl VqCodebook {
@@ -215,18 +223,15 @@ impl VqCodebook {
         // Cast to F32 if needed (weights may be BF16)
         let embeddings = embeddings.to_dtype(DType::F32)?;
         let cluster_usage = cluster_usage.to_dtype(DType::F32)?;
-        Ok(Self {
-            embeddings,
-            cluster_usage,
-        })
+        // Normalize once: embed = embedding_sum / cluster_usage.unsqueeze(-1)
+        let usage = cluster_usage.unsqueeze(1)?.clamp(1e-7, f64::MAX)?; // (codebook_size, 1)
+        let embeddings = embeddings.broadcast_div(&usage)?;
+        Ok(Self { embeddings })
     }
 
-    /// Look up embedding by indices, normalizing by cluster usage.
+    /// Look up embedding by indices.
     fn forward(&self, indices: &Tensor) -> Result<Tensor> {
-        // Normalize: embed = embedding_sum / cluster_usage.unsqueeze(-1)
-        let usage = self.cluster_usage.unsqueeze(1)?; // (codebook_size, 1)
-        let usage = usage.clamp(1e-7, f64::MAX)?;
-        let normalized = self.embeddings.broadcast_div(&usage)?;
+        let normalized = &self.embeddings;
         // Index: flatten → select → reshape
         let flat = indices.flatten_all()?;
         let looked_up = normalized.index_select(&flat, 0)?;
@@ -635,6 +640,9 @@ impl ConvNeXtBlock {
 /// multiply-adds: Candle runs grouped convolutions one group at a time,
 /// which is a GPU call per channel.
 fn depthwise_conv(x: &Tensor, conv: &Conv1d) -> Result<Tensor> {
+    if let Some(y) = depthwise_conv1d(x, conv.weight(), conv.bias())? {
+        return Ok(y);
+    }
     let weight = conv.weight(); // (channels, 1, kernel)
     let (channels, _, kernel) = weight.dims3()?;
     let out_len = x.dim(2)? + 1 - kernel;
@@ -654,6 +662,7 @@ fn depthwise_conv(x: &Tensor, conv: &Conv1d) -> Result<Tensor> {
 /// Upsample stage: ConvTranspose1d (stride=2) + ConvNeXt block.
 struct UpsampleStage {
     conv: ConvTranspose1d,
+    metal_conv: Option<MetalConv>,
     convnext: ConvNeXtBlock,
 }
 
@@ -670,13 +679,21 @@ impl UpsampleStage {
             },
             vb.pp("0.conv"),
         )?;
+        let metal_conv = MetalConv::conv_transpose1d(&conv)?;
         let convnext = ConvNeXtBlock::load(channels, channels * 4, vb.pp("1"))?;
-        Ok(Self { conv, convnext })
+        Ok(Self {
+            conv,
+            metal_conv,
+            convnext,
+        })
     }
 
     fn forward(&self, x: &Tensor, stream: Option<&mut DecoderStream>) -> Result<Tensor> {
         // kernel = stride: no overlap between chunks.
-        let h = self.conv.forward(x)?;
+        let h = match self.metal_conv.as_ref().filter(|conv| conv.supports(x)) {
+            Some(conv) => conv.forward(x, None, None)?,
+            None => self.conv.forward(x)?,
+        };
         self.convnext.forward(&h, stream)
     }
 }
@@ -693,6 +710,9 @@ struct SnacResBlock {
     conv2: Conv1d,
     /// Left-pad amount for conv1 (causal): (kernel-1) * dilation.
     conv1_left_pad: usize,
+    /// On Metal: each convolution with the SnakeBeta before it (and the
+    /// second with the residual) in one kernel.
+    metal: Option<[(MetalConv, Snake); 2]>,
 }
 
 impl SnacResBlock {
@@ -722,6 +742,13 @@ impl SnacResBlock {
             Conv1dConfig::default(),
             vb.pp("conv2.conv"),
         )?;
+        let metal = match (MetalConv::conv1d(&conv1)?, MetalConv::conv1d(&conv2)?) {
+            (Some(metal1), Some(metal2)) => Some([
+                (metal1, Snake::new(&act1_alpha, &act1_beta)?),
+                (metal2, Snake::new(&act2_alpha, &act2_beta)?),
+            ]),
+            _ => None,
+        };
         Ok(Self {
             act1_alpha,
             act1_beta,
@@ -730,10 +757,19 @@ impl SnacResBlock {
             act2_beta,
             conv2,
             conv1_left_pad,
+            metal,
         })
     }
 
     fn forward(&self, x: &Tensor, stream: Option<&mut DecoderStream>) -> Result<Tensor> {
+        if let Some([(conv1, act1), (conv2, act2)]) = &self.metal {
+            if conv1.supports(x) {
+                // SnakeBeta runs in the convolution, so a stream keeps raw inputs.
+                let h = stream_pad(x, self.conv1_left_pad, stream)?;
+                let h = conv1.forward(&h, Some(act1), None)?;
+                return conv2.forward(&h, Some(act2), Some(x));
+            }
+        }
         let alpha1 = self.act1_alpha.unsqueeze(0)?.unsqueeze(2)?;
         let beta1 = self.act1_beta.unsqueeze(0)?.unsqueeze(2)?;
         let h = snake_beta(x, &alpha1, &beta1)?;
@@ -752,6 +788,8 @@ struct DecoderStage {
     snake_alpha_param: Tensor,
     snake_beta_param: Tensor,
     upsample_conv: ConvTranspose1d,
+    /// On Metal: SnakeBeta and the transposed convolution in one kernel.
+    metal_conv: Option<(MetalConv, Snake)>,
     res_blocks: Vec<SnacResBlock>,
 }
 
@@ -797,29 +835,42 @@ impl DecoderStage {
             )?);
         }
 
+        let metal_conv = match MetalConv::conv_transpose1d(&upsample_conv)? {
+            Some(conv) => Some((conv, Snake::new(&snake_alpha_param, &snake_beta_param)?)),
+            None => None,
+        };
         Ok(Self {
             snake_alpha_param,
             snake_beta_param,
             upsample_conv,
+            metal_conv,
             res_blocks,
         })
     }
 
     fn forward(&self, x: &Tensor, mut stream: Option<&mut DecoderStream>) -> Result<Tensor> {
-        let alpha = self.snake_alpha_param.unsqueeze(0)?.unsqueeze(2)?;
-        let beta = self.snake_beta_param.unsqueeze(0)?.unsqueeze(2)?;
-        let h = snake_beta(x, &alpha, &beta)?;
-        let h = self.upsample_conv.forward(&h)?;
-        // Trim right side for causal ConvTranspose1d
         let kernel_size = self.upsample_conv.weight().dim(2)?;
         let stride = kernel_size / 2;
-        let right_pad = kernel_size - stride;
-        let mut h = stream_overlap(
-            h,
-            right_pad,
-            self.upsample_conv.bias(),
-            stream.as_deref_mut(),
-        )?;
+        let metal = self.metal_conv.as_ref().filter(|(conv, _)| conv.supports(x));
+        let mut h = if let Some((conv, snake)) = metal {
+            // The kernel reads the previous input in place of the overhang
+            // the previous chunk would add, so a stream keeps that instead.
+            let h = stream_pad(x, kernel_size / stride - 1, stream.as_deref_mut())?;
+            conv.forward(&h, Some(snake), None)?
+        } else {
+            let alpha = self.snake_alpha_param.unsqueeze(0)?.unsqueeze(2)?;
+            let beta = self.snake_beta_param.unsqueeze(0)?.unsqueeze(2)?;
+            let h = snake_beta(x, &alpha, &beta)?;
+            let h = self.upsample_conv.forward(&h)?;
+            // Trim right side for causal ConvTranspose1d
+            let right_pad = kernel_size - stride;
+            stream_overlap(
+                h,
+                right_pad,
+                self.upsample_conv.bias(),
+                stream.as_deref_mut(),
+            )?
+        };
         for block in &self.res_blocks {
             h = block.forward(&h, stream.as_deref_mut())?;
         }
@@ -840,12 +891,14 @@ pub struct SpeechTokenizerDecoder {
     rvq_rest: RvqLayer,
     /// Pre-convolution: quantizer_dim → decoder_channels.
     pre_conv: Conv1d,
+    metal_pre_conv: Option<MetalConv>,
     /// Pre-transformer for refinement.
     pre_transformer: PreTransformer,
     /// Upsample stages (ConvNeXt-style).
     upsample_stages: Vec<UpsampleStage>,
     /// Initial decoder conv (expands channels).
     decoder_init_conv: Conv1d,
+    metal_init_conv: Option<MetalConv>,
     /// Decoder stages (SnakeBeta + ConvTranspose + ResBlocks).
     decoder_stages: Vec<DecoderStage>,
     /// Final SnakeBeta alpha parameter.
@@ -854,6 +907,8 @@ pub struct SpeechTokenizerDecoder {
     final_snake_beta: Tensor,
     /// Final convolution → 1 channel.
     final_conv: Conv1d,
+    /// On Metal: the final SnakeBeta and convolution in one kernel.
+    metal_final_conv: Option<(MetalConv, Snake)>,
     /// Config reference.
     config: SpeechTokenizerConfig,
 }
@@ -950,17 +1005,25 @@ impl SpeechTokenizerDecoder {
             ddec_vb.pp("6.conv"),
         )?;
 
+        let metal_final_conv = match MetalConv::conv1d(&final_conv)? {
+            Some(conv) => Some((conv, Snake::new(&final_snake_alpha, &final_snake_beta)?)),
+            None => None,
+        };
+
         Ok(Self {
             rvq_first,
             rvq_rest,
+            metal_pre_conv: MetalConv::conv1d(&pre_conv)?,
             pre_conv,
             pre_transformer,
             upsample_stages,
+            metal_init_conv: MetalConv::conv1d(&decoder_init_conv)?,
             decoder_init_conv,
             decoder_stages,
             final_snake_alpha,
             final_snake_beta,
             final_conv,
+            metal_final_conv,
             config: config.clone(),
         })
     }
@@ -999,9 +1062,11 @@ impl SpeechTokenizerDecoder {
         let h = (&first_features + &rest_features)?; // (batch, 512, seq_len)
 
         // ── 2. Pre-conv (causal: left-pad 2) ──────────────────────────
-        let h = self
-            .pre_conv
-            .forward(&stream_pad(&h, 2, stream.as_deref_mut())?)?; // (batch, 1024, seq_len)
+        let h = conv_forward(
+            &self.pre_conv,
+            self.metal_pre_conv.as_ref(),
+            &stream_pad(&h, 2, stream.as_deref_mut())?,
+        )?; // (batch, 1024, seq_len)
 
         // ── 3. Pre-transformer ────────────────────────────────────────
         let h = self.pre_transformer.forward(&h, stream.as_deref_mut())?;
@@ -1013,21 +1078,30 @@ impl SpeechTokenizerDecoder {
         }
 
         // ── 5. Decoder sequential (init conv: causal left-pad 6) ──────
-        h = self
-            .decoder_init_conv
-            .forward(&stream_pad(&h, 6, stream.as_deref_mut())?)?;
+        h = conv_forward(
+            &self.decoder_init_conv,
+            self.metal_init_conv.as_ref(),
+            &stream_pad(&h, 6, stream.as_deref_mut())?,
+        )?;
 
         for stage in &self.decoder_stages {
             h = stage.forward(&h, stream.as_deref_mut())?;
         }
 
         // ── 6. Final activation + conv (causal left-pad 6) ─────────────
-        let alpha = self.final_snake_alpha.unsqueeze(0)?.unsqueeze(2)?;
-        let beta = self.final_snake_beta.unsqueeze(0)?.unsqueeze(2)?;
-        let h = snake_beta(&h, &alpha, &beta)?;
-        let h = self
-            .final_conv
-            .forward(&stream_pad(&h, 6, stream.as_deref_mut())?)?; // (batch, 1, samples)
+        let h = match self.metal_final_conv.as_ref().filter(|(conv, _)| conv.supports(&h)) {
+            // SnakeBeta runs in the convolution, so a stream keeps raw inputs.
+            Some((conv, snake)) => {
+                conv.forward(&stream_pad(&h, 6, stream.as_deref_mut())?, Some(snake), None)?
+            }
+            None => {
+                let alpha = self.final_snake_alpha.unsqueeze(0)?.unsqueeze(2)?;
+                let beta = self.final_snake_beta.unsqueeze(0)?.unsqueeze(2)?;
+                let h = snake_beta(&h, &alpha, &beta)?;
+                self.final_conv
+                    .forward(&stream_pad(&h, 6, stream.as_deref_mut())?)?
+            }
+        }; // (batch, 1, samples)
         if let Some(stream) = stream {
             stream.frames += seq_len;
             stream.tail_index = 0;
