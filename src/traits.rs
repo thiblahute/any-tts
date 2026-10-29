@@ -264,6 +264,20 @@ pub struct VoiceEmbedding {
     shape: Vec<usize>,
     /// Model type identifier (e.g. "kokoro", "qwen3-tts").
     model_type: String,
+    /// Reference prompt, for models whose cloning also conditions on what
+    /// the reference audio says (Qwen3-TTS's in-context cloning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prompt: Option<VoicePrompt>,
+}
+
+/// The reference audio of a cloned voice as the model's own codec frames,
+/// with its transcript. Models that clone in context continue from it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct VoicePrompt {
+    /// Codec codes of the reference, one row of codebook entries per frame.
+    pub codes: Vec<Vec<u32>>,
+    /// What the reference audio says.
+    pub text: String,
 }
 
 impl VoiceEmbedding {
@@ -273,7 +287,24 @@ impl VoiceEmbedding {
             data,
             shape,
             model_type: model_type.into(),
+            prompt: None,
         }
+    }
+
+    /// Attach a reference prompt (codec frames and transcript).
+    pub fn with_prompt(mut self, prompt: VoicePrompt) -> Self {
+        self.prompt = Some(prompt);
+        self
+    }
+
+    /// The reference prompt, if the voice carries one.
+    pub fn prompt(&self) -> Option<&VoicePrompt> {
+        self.prompt.as_ref()
+    }
+
+    /// Raw embedding data as flattened f32 values.
+    pub fn data(&self) -> &[f32] {
+        &self.data
     }
 
     /// Reconstruct the embedding as a candle [`Tensor`](candle_core::Tensor).
@@ -345,4 +376,27 @@ pub trait VoiceCloning: TtsModel {
         request: &SynthesisRequest,
         voice: &VoiceEmbedding,
     ) -> Result<AudioSamples, TtsError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn voice_embedding_prompt_is_optional_in_json() {
+        let plain: VoiceEmbedding =
+            serde_json::from_str(r#"{"data":[0.5],"shape":[1],"model_type":"kokoro"}"#).unwrap();
+        assert!(plain.prompt().is_none());
+        assert!(!serde_json::to_string(&plain).unwrap().contains("prompt"));
+
+        let prompt = VoicePrompt {
+            codes: vec![vec![1, 2], vec![3, 4]],
+            text: "Hello.".into(),
+        };
+        let cloned = VoiceEmbedding::new(vec![0.5], vec![1], "qwen3-tts").with_prompt(prompt.clone());
+        let json = serde_json::to_string(&cloned).unwrap();
+        let back: VoiceEmbedding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.prompt(), Some(&prompt));
+        assert_eq!(back.data(), &[0.5]);
+    }
 }

@@ -19,7 +19,7 @@ use crate::layers::transformer::TransformerBlock;
 use crate::tensor_utils::{precompute_rope_freqs, RmsNorm};
 
 use super::config::TalkerConfig;
-use super::sampling::{apply_repetition_penalty, sample_logits};
+use super::sampling::{apply_repetition_penalty, sample_logits, RepetitionHistory};
 
 pub type TalkerPredictAndSumFn<'a> =
     dyn FnMut(&Tensor, u32, &Tensor, &Device) -> Result<(Tensor, Vec<u32>)> + 'a;
@@ -28,6 +28,9 @@ pub struct TalkerGenerationConfig<'a> {
     max_tokens: usize,
     temperature: f64,
     top_k: usize,
+    repetition_penalty: f32,
+    /// How many of the latest tokens the penalty looks at; all if `None`.
+    repetition_window: Option<usize>,
     predict_and_sum_fn: Option<&'a mut TalkerPredictAndSumFn<'a>>,
 }
 
@@ -37,8 +40,17 @@ impl<'a> TalkerGenerationConfig<'a> {
             max_tokens,
             temperature,
             top_k,
+            // The reference's generation_config.json.
+            repetition_penalty: 1.05,
+            repetition_window: None,
             predict_and_sum_fn: None,
         }
+    }
+
+    pub fn with_repetition_penalty(mut self, penalty: f32, window: Option<usize>) -> Self {
+        self.repetition_penalty = penalty;
+        self.repetition_window = window;
+        self
     }
 
     pub fn with_predict_and_sum_fn(
@@ -302,11 +314,10 @@ impl TalkerLm {
         };
 
         let mut generated = Vec::new();
-        let mut seen = vec![false; self.config.vocab_size];
+        let mut history = RepetitionHistory::new(self.config.vocab_size, generation.repetition_window);
         let mut all_group_tokens: Vec<Vec<u32>> = Vec::new();
 
-        // Repetition penalty (reference uses 1.05)
-        let repetition_penalty: f32 = 1.05;
+        let repetition_penalty = generation.repetition_penalty;
         let trailing_len = trailing_text_hidden.dims()[1];
 
         // --- Predict the FIRST token from the prefill output ---
@@ -315,7 +326,7 @@ impl TalkerLm {
         let first_logits = self.logits(&last_hidden.unsqueeze(1)?)?.squeeze(1)?;
         let first_token = sample_codec_token(
             &first_logits,
-            &seen,
+            history.seen(),
             repetition_penalty,
             suppress_start,
             self.config.codec_eos_token_id,
@@ -331,7 +342,7 @@ impl TalkerLm {
         }
 
         generated.push(first_token);
-        seen[first_token as usize] = true;
+        history.push(first_token);
 
         // Build next step input using code predictor on the first token
         let g0_token_tensor = Tensor::new(&[first_token], device)?.unsqueeze(0)?;
@@ -367,7 +378,7 @@ impl TalkerLm {
             let logits = self.logits(&last_hidden.unsqueeze(1)?)?.squeeze(1)?;
             let next_token = sample_codec_token(
                 &logits,
-                &seen,
+                history.seen(),
                 repetition_penalty,
                 suppress_start,
                 self.config.codec_eos_token_id,
@@ -382,7 +393,7 @@ impl TalkerLm {
             }
 
             generated.push(next_token);
-            seen[next_token as usize] = true;
+            history.push(next_token);
 
             // Build next step input using code predictor feedback loop.
             // Reference: codec_hiddens = [last_id_hidden] + [cp_embed[i](predicted_group_i) for i in 0..14]

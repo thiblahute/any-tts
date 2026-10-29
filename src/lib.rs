@@ -73,6 +73,7 @@ pub use mel::{MelConfig, MelSpectrogram};
 pub use models::{ModelAssetRequirement, ModelType};
 pub use traits::{
     ModelInfo, ReferenceAudio, SynthesisRequest, TtsModel, VoiceCloning, VoiceEmbedding,
+    VoicePrompt,
 };
 
 /// Load a TTS model based on the provided configuration.

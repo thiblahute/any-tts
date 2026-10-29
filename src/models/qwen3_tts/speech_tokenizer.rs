@@ -51,7 +51,9 @@ fn causal_pad(x: &Tensor, left: usize) -> Result<Tensor> {
 /// that decoding chunk by chunk gives the same audio as decoding all at
 /// once: the tail of each causal convolution's input, the overlap of each
 /// transposed convolution, and the pre-transformer's recent keys and values.
-#[derive(Debug, Default)]
+/// Cloning a stream forks it: a stream primed with a voice's reference
+/// codes can start each sentence's decode where the reference ended.
+#[derive(Debug, Default, Clone)]
 pub struct DecoderStream {
     tails: Vec<Tensor>,
     overflows: Vec<Tensor>,
@@ -65,6 +67,11 @@ pub struct DecoderStream {
 impl DecoderStream {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Frames decoded so far.
+    pub fn frames(&self) -> usize {
+        self.frames
     }
 }
 

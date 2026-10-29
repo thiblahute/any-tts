@@ -86,9 +86,61 @@ pub(super) fn apply_repetition_penalty(logits: &mut [f32], seen: &[bool], penalt
     }
 }
 
+/// The tokens the repetition penalty applies to: all generated so far, or
+/// only the latest `window` of them.
+pub(super) struct RepetitionHistory {
+    tokens: Vec<u32>,
+    counts: Vec<u32>,
+    seen: Vec<bool>,
+    window: Option<usize>,
+}
+
+impl RepetitionHistory {
+    pub(super) fn new(vocab_size: usize, window: Option<usize>) -> Self {
+        Self {
+            tokens: Vec::new(),
+            counts: vec![0; vocab_size],
+            seen: vec![false; vocab_size],
+            window,
+        }
+    }
+
+    /// Record a generated token, forgetting the one that leaves the window.
+    pub(super) fn push(&mut self, token: u32) {
+        self.tokens.push(token);
+        self.counts[token as usize] += 1;
+        self.seen[token as usize] = true;
+        if let Some(window) = self.window.filter(|&window| self.tokens.len() > window) {
+            let old = self.tokens[self.tokens.len() - 1 - window] as usize;
+            self.counts[old] -= 1;
+            self.seen[old] = self.counts[old] > 0;
+        }
+    }
+
+    pub(super) fn seen(&self) -> &[bool] {
+        &self.seen
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repetition_window_forgets_old_tokens() {
+        let mut history = RepetitionHistory::new(4, Some(2));
+        for token in [0, 1, 1] {
+            history.push(token);
+        }
+        assert_eq!(history.seen(), &[false, true, false, false]);
+        history.push(2);
+        assert_eq!(history.seen(), &[false, true, true, false]);
+        let mut all = RepetitionHistory::new(4, None);
+        for token in [0, 1, 1, 2] {
+            all.push(token);
+        }
+        assert_eq!(all.seen(), &[true, true, true, false]);
+    }
 
     #[test]
     fn repeated_history_penalizes_each_token_once() {

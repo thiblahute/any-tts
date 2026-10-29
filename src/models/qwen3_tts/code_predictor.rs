@@ -140,6 +140,11 @@ impl CodePredictor {
         })
     }
 
+    /// Embed codes of codebook `group` (1..N-1) in the talker's hidden space.
+    pub fn embed_group(&self, group: usize, token_ids: &Tensor) -> Result<Tensor> {
+        self.group_embeds[group - 1].forward(token_ids)
+    }
+
     /// Predict groups 1..N-1 for a single time step and return the summed
     /// embedding of all groups (used in the talker's feedback loop), plus
     /// the predicted token IDs for groups 1..N-1.

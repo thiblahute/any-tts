@@ -2,16 +2,29 @@
 //! model once, and writes one WAV per sentence.
 //!
 //!   cargo run --release --features metal --example roamgate_sentences -- \
-//!     <model-dir> <sentences.tsv> <out-dir> [speaker]
+//!     <model-dir> <sentences.tsv> <out-dir> [speaker | voice.json]
+//!
+//! A voice JSON (from scripts/qwen3_tts_voice.py) clones that voice with a
+//! Qwen3-TTS Base model instead of using a named speaker.
 
-use any_tts::traits::TtsModel;
-use any_tts::{load_model, DeviceSelection, ModelType, SynthesisRequest, TtsConfig};
+use any_tts::{
+    load_model, DeviceSelection, ModelType, SynthesisRequest, TtsConfig, VoiceEmbedding,
+};
 use std::time::Instant;
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let [model_dir, sentences, out_dir] = [&args[0], &args[1], &args[2]];
     let speaker = args.get(3).cloned().unwrap_or_else(|| "ryan".into());
+    let voice = if speaker.ends_with(".json") {
+        Some(VoiceEmbedding::load(&speaker)?)
+    } else {
+        None
+    };
+    let with_voice = |request: SynthesisRequest| match &voice {
+        Some(voice) => request.with_voice_embedding(voice.clone()),
+        None => request.with_voice(&speaker),
+    };
     std::fs::create_dir_all(out_dir)?;
 
     let started = Instant::now();
@@ -23,15 +36,22 @@ fn main() -> anyhow::Result<()> {
     println!("load {:.0} ms, speakers {:?}", started.elapsed().as_secs_f64() * 1000.0, model.supported_voices());
 
     // A first run warms the GPU kernels up; it is not counted.
-    let warm = SynthesisRequest::new("Warming up.").with_language("English").with_voice(&speaker);
-    let started = Instant::now();
-    model.synthesize(&warm)?;
-    println!("warm-up {:.0} ms", started.elapsed().as_secs_f64() * 1000.0);
+    // With a cloned voice, it also prepares the voice, once.
+    let warm = with_voice(SynthesisRequest::new("Warming up.").with_language("English"));
+    for _ in 0..2 {
+        let started = Instant::now();
+        let audio = model.synthesize(&warm)?;
+        println!(
+            "warm-up {:.0} ms for {:.1} s",
+            started.elapsed().as_secs_f64() * 1000.0,
+            audio.samples.len() as f64 / audio.sample_rate as f64
+        );
+    }
 
     for (index, line) in std::fs::read_to_string(sentences)?.lines().enumerate() {
         let Some((lang, text)) = line.split_once('\t') else { continue };
         let language = if lang == "fr" { "French" } else { "English" };
-        let request = SynthesisRequest::new(text).with_language(language).with_voice(&speaker);
+        let request = with_voice(SynthesisRequest::new(text).with_language(language));
         let started = Instant::now();
         let mut first_audio_ms = None;
         let mut samples = Vec::new();

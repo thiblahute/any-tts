@@ -8,19 +8,62 @@
 //!                    Speech Tokenizer Decoder (codes → 24kHz waveform)
 
 use candle_core::{DType, Device, Tensor};
-use std::sync::Mutex;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use crate::audio::AudioSamples;
 use crate::config::{ModelFiles, TtsConfig};
 use crate::error::TtsError;
 use crate::tokenizer::TextTokenizer;
-use crate::traits::{ModelInfo, SynthesisRequest, TtsModel};
+use crate::traits::{
+    ModelInfo, ReferenceAudio, SynthesisRequest, TtsModel, VoiceCloning, VoiceEmbedding,
+};
 
 use super::code_predictor::CodePredictor;
 use super::config::Qwen3TtsConfig;
-use super::speech_tokenizer::{SpeechTokenizerConfig, SpeechTokenizerDecoder};
+use super::speech_tokenizer::{DecoderStream, SpeechTokenizerConfig, SpeechTokenizerDecoder};
 use super::talker::{TalkerGenerationConfig, TalkerLm};
+
+/// How cloned voices are exported, since the speaker and speech encoders
+/// are not ported yet.
+const VOICE_EXPORT_HINT: &str = "export the voice with scripts/qwen3_tts_voice.py \
+     (mlx-audio) and pass it with SynthesisRequest::with_voice_embedding";
+
+/// In-context cloning repeats codes easily; like the reference, it uses a
+/// stronger repetition penalty over the latest tokens.
+const ICL_REPETITION_PENALTY: f32 = 1.5;
+const ICL_REPETITION_WINDOW: usize = 64;
+
+/// A cloned voice, prepared once and reused for each sentence.
+struct PreparedVoice {
+    key: u64,
+    /// The speaker x-vector, in the codec prefix: (1, 1, hidden).
+    speaker: Tensor,
+    /// The reference prompt, for in-context cloning.
+    icl: Option<IclPrompt>,
+}
+
+/// What in-context cloning adds to the prompt, and the decoder state after
+/// the reference audio.
+struct IclPrompt {
+    /// The reference transcript's tokens, read before the sentence's.
+    text_ids: Vec<u32>,
+    /// The reference frames' summed codebook embeddings over tts_pad, which
+    /// follow codec_bos at the end of the prompt: (1, frames, hidden).
+    codec_rows: Tensor,
+    /// A speech-tokenizer stream that has decoded the reference frames, so
+    /// that each sentence's audio continues from them without decoding
+    /// them again.
+    primed: DecoderStream,
+}
+
+/// The speaker slot of the codec prefix.
+#[derive(Clone, Copy)]
+enum Speaker<'a> {
+    Id(u32),
+    XVector(&'a Tensor),
+}
 
 /// Qwen3-TTS-12Hz TTS model.
 ///
@@ -29,14 +72,17 @@ use super::talker::{TalkerGenerationConfig, TalkerLm};
 pub struct Qwen3TtsModel {
     config: Qwen3TtsConfig,
     device: Device,
-    #[allow(dead_code)]
     dtype: DType,
     files: ModelFiles,
+    /// Loaded once: loading it takes longer than a sentence's prompt.
+    tokenizer: TextTokenizer,
     /// Wrapped in Mutex for interior mutability (KV-cache updates during generation).
     talker: Mutex<TalkerLm>,
     /// Wrapped in Mutex for interior mutability (KV-cache updates during prediction).
     code_predictor: Option<Mutex<CodePredictor>>,
     speech_tokenizer: Option<SpeechTokenizerDecoder>,
+    /// The last cloned voice used, prepared.
+    voice: Mutex<Option<Arc<PreparedVoice>>>,
 }
 
 impl TtsModel for Qwen3TtsModel {
@@ -69,6 +115,13 @@ impl TtsModel for Qwen3TtsModel {
             model_config.talker_config.hidden_size,
             model_config.talker_config.num_code_groups,
         );
+
+        let tokenizer = TextTokenizer::from_asset(
+            files
+                .tokenizer
+                .as_ref()
+                .expect("validated by resolve_files"),
+        )?;
 
         // ── Load main model weights ───────────────────────────────────
         let vb = ModelFiles::load_safetensors_vb(&files.weights, dtype, &device)?;
@@ -135,9 +188,11 @@ impl TtsModel for Qwen3TtsModel {
             device,
             dtype,
             files,
+            tokenizer,
             talker: Mutex::new(talker),
             code_predictor: code_predictor.map(Mutex::new),
             speech_tokenizer,
+            voice: Mutex::new(None),
         })
     }
 
@@ -145,23 +200,21 @@ impl TtsModel for Qwen3TtsModel {
         info!("Qwen3-TTS synthesize: \"{}\"", request.text);
 
         self.validate_request(request)?;
-
-        let token_ids = self.tokenize_text(&request.text)?;
-        let instruct_token_ids = self.tokenize_instruct(request.instruct.as_deref())?;
-        let (speaker_id, language_id) = self.resolve_speaker_language(request);
-        let (full_input, trailing_text_hidden) = self.build_input_embeddings(
-            &token_ids,
-            instruct_token_ids.as_deref(),
-            speaker_id,
-            language_id,
-        )?;
+        let voice = self.prepare_voice(request)?;
+        let (full_input, trailing_text_hidden) = self.prepare_inputs(request, voice.as_deref())?;
 
         info!("Input sequence shape: {:?}", full_input.shape());
 
-        let (codec_tokens_g0, hidden_states) =
-            self.generate_codec_tokens(&full_input, &trailing_text_hidden, request, None)?;
+        let icl = voice.as_ref().and_then(|voice| voice.icl.as_ref());
+        let (codec_tokens_g0, hidden_states) = self.generate_codec_tokens(
+            &full_input,
+            &trailing_text_hidden,
+            request,
+            icl.is_some(),
+            None,
+        )?;
         let all_codes = self.assemble_all_codes(&codec_tokens_g0, &hidden_states)?;
-        let samples = self.decode_to_audio(&all_codes)?;
+        let samples = self.decode_to_audio(&all_codes, icl.map(|icl| &icl.primed))?;
 
         info!(
             "Synthesized {} samples ({:.2}s at 24000Hz)",
@@ -185,22 +238,17 @@ impl TtsModel for Qwen3TtsModel {
         let speech_tokenizer = self.speech_tokenizer.as_ref().ok_or_else(|| {
             TtsError::ModelError("Qwen3-TTS: speech tokenizer not loaded".to_string())
         })?;
-        let token_ids = self.tokenize_text(&request.text)?;
-        let instruct_token_ids = self.tokenize_instruct(request.instruct.as_deref())?;
-        let (speaker_id, language_id) = self.resolve_speaker_language(request);
-        let (full_input, trailing_text_hidden) = self.build_input_embeddings(
-            &token_ids,
-            instruct_token_ids.as_deref(),
-            speaker_id,
-            language_id,
-        )?;
+        let voice = self.prepare_voice(request)?;
+        let (full_input, trailing_text_hidden) = self.prepare_inputs(request, voice.as_deref())?;
+        let icl = voice.as_ref().and_then(|voice| voice.icl.as_ref());
 
-        let mut stream = super::speech_tokenizer::DecoderStream::new();
+        // A cloned voice's audio continues from its reference's.
+        let mut stream = icl.map_or_else(DecoderStream::new, |icl| icl.primed.clone());
         let mut pending: Vec<(u32, Vec<u32>)> = Vec::new();
         let mut chunks = 0usize;
         let mut failure: Option<TtsError> = None;
         let mut decode = |frames: &[(u32, Vec<u32>)],
-                          stream: &mut super::speech_tokenizer::DecoderStream|
+                          stream: &mut DecoderStream|
          -> Result<(), TtsError> {
             let g0: Vec<u32> = frames.iter().map(|(g0, _)| *g0).collect();
             let groups: Vec<Vec<u32>> = frames.iter().map(|(_, groups)| groups.clone()).collect();
@@ -230,6 +278,7 @@ impl TtsModel for Qwen3TtsModel {
             &full_input,
             &trailing_text_hidden,
             request,
+            icl.is_some(),
             Some(&mut on_frame),
         );
         if let Some(error) = failure {
@@ -266,6 +315,8 @@ impl TtsModel for Qwen3TtsModel {
     fn model_info(&self) -> ModelInfo {
         let name = if self.config.is_voice_design() {
             "Qwen3-TTS-12Hz-1.7B-VoiceDesign".to_string()
+        } else if self.is_base() {
+            "Qwen3-TTS-12Hz-1.7B-Base".to_string()
         } else {
             "Qwen3-TTS-12Hz-1.7B-CustomVoice".to_string()
         };
@@ -297,6 +348,157 @@ impl Qwen3TtsModel {
     /// Get the resolved file paths.
     pub fn files(&self) -> &ModelFiles {
         &self.files
+    }
+
+    fn is_base(&self) -> bool {
+        self.config.tts_model_type == "base"
+    }
+
+    /// Tokenize the request, resolve its speaker and language, and build the
+    /// prompt embeddings, with the cloned voice when there is one.
+    fn prepare_inputs(
+        &self,
+        request: &SynthesisRequest,
+        voice: Option<&PreparedVoice>,
+    ) -> Result<(Tensor, Tensor), TtsError> {
+        let token_ids = self.tokenize_text(&request.text)?;
+        let instruct_token_ids = self.tokenize_instruct(request.instruct.as_deref())?;
+        let (speaker_id, language_id) = self.resolve_speaker_language(request);
+        let speaker = match voice {
+            Some(voice) => Some(Speaker::XVector(&voice.speaker)),
+            None => speaker_id.map(Speaker::Id),
+        };
+        self.build_input_embeddings(
+            &token_ids,
+            instruct_token_ids.as_deref(),
+            speaker,
+            language_id,
+            voice.and_then(|voice| voice.icl.as_ref()),
+        )
+    }
+
+    /// The request's cloned voice, prepared: from the cache when it is the
+    /// voice of the previous request, else computed once here.
+    fn prepare_voice(
+        &self,
+        request: &SynthesisRequest,
+    ) -> Result<Option<Arc<PreparedVoice>>, TtsError> {
+        let Some(embedding) = request.voice_embedding.as_ref() else {
+            return Ok(None);
+        };
+        let key = voice_key(embedding);
+        if let Some(voice) = self.voice.lock().unwrap().as_ref() {
+            if voice.key == key {
+                return Ok(Some(voice.clone()));
+            }
+        }
+
+        let tc = &self.config.talker_config;
+        let hidden = tc.hidden_size;
+        if embedding.data().len() != hidden {
+            return Err(TtsError::ModelError(format!(
+                "Qwen3-TTS: speaker embedding has {} values, the model needs {hidden}",
+                embedding.data().len()
+            )));
+        }
+        let speaker = Tensor::new(embedding.data(), &self.device)
+            .and_then(|t| t.to_dtype(self.dtype))
+            .and_then(|t| t.reshape((1, 1, hidden)))
+            .map_err(TtsError::ComputeError)?;
+
+        let icl = match embedding.prompt() {
+            Some(prompt) => Some(self.prepare_icl_prompt(&prompt.codes, &prompt.text)?),
+            None => None,
+        };
+        let voice = Arc::new(PreparedVoice { key, speaker, icl });
+        *self.voice.lock().unwrap() = Some(voice.clone());
+        Ok(Some(voice))
+    }
+
+    /// Embed a voice's reference frames for the prompt, tokenize its
+    /// transcript, and prime a decoder stream with the frames.
+    fn prepare_icl_prompt(&self, codes: &[Vec<u32>], text: &str) -> Result<IclPrompt, TtsError> {
+        let groups = self.config.talker_config.num_code_groups;
+        let codebook = 2048;
+        if codes.is_empty()
+            || codes
+                .iter()
+                .any(|frame| frame.len() != groups || frame.iter().any(|&c| c >= codebook))
+        {
+            return Err(TtsError::ModelError(format!(
+                "Qwen3-TTS: voice prompt codes must be frames of {groups} codes below {codebook}"
+            )));
+        }
+        if text.trim().is_empty() {
+            return Err(TtsError::ModelError(
+                "Qwen3-TTS: voice prompt has codes but no transcript".into(),
+            ));
+        }
+        let speech_tokenizer = self.speech_tokenizer.as_ref().ok_or_else(|| {
+            TtsError::ModelError("Qwen3-TTS: speech tokenizer not loaded".to_string())
+        })?;
+
+        // The transcript alone: <|im_start|>assistant\n{text}<|im_end|>\n
+        // without its 3 role tokens and 2 closing ones, as the reference does.
+        let ids = self.tokenizer.encode(&format!("<|im_start|>assistant\n{text}<|im_end|>\n"))?;
+        if ids.len() < 6 {
+            return Err(TtsError::ModelError(
+                "Qwen3-TTS: voice prompt transcript too short".into(),
+            ));
+        }
+        let text_ids = ids[3..ids.len() - 2].to_vec();
+
+        let frames = codes.len();
+        let flat: Vec<u32> = codes.iter().flatten().copied().collect();
+        // (1, frames, groups) for the embeddings, (1, groups, frames) to decode.
+        let codes = Tensor::from_vec(flat, (1, frames, groups), &self.device)
+            .map_err(TtsError::ComputeError)?;
+        let codec_rows = {
+            let talker = self.talker.lock().unwrap();
+            let cp = self
+                .code_predictor
+                .as_ref()
+                .ok_or_else(|| {
+                    TtsError::ModelError("Qwen3-TTS: voice cloning needs the code predictor".into())
+                })?
+                .lock()
+                .unwrap();
+            let group = |g: usize| codes.narrow(2, g, 1).and_then(|c| c.squeeze(2));
+            let mut sum = talker
+                .embed_codec(&group(0).map_err(TtsError::ComputeError)?)
+                .map_err(TtsError::ComputeError)?;
+            for g in 1..groups {
+                let ids = group(g).map_err(TtsError::ComputeError)?;
+                let embed = cp.embed_group(g, &ids).map_err(TtsError::ComputeError)?;
+                sum = (sum + embed).map_err(TtsError::ComputeError)?;
+            }
+            let pad = Tensor::new(&[[self.config.tts_pad_token_id]], &self.device)
+                .and_then(|ids| talker.embed_text(&ids))
+                .map_err(TtsError::ComputeError)?;
+            sum.broadcast_add(&pad).map_err(TtsError::ComputeError)?
+        };
+
+        // Decoding the reference here, once, leaves the stream where each
+        // sentence's audio starts; the reference's own samples are dropped.
+        let mut primed = DecoderStream::new();
+        let tokens = codes
+            .transpose(1, 2)
+            .and_then(|t| t.contiguous())
+            .map_err(TtsError::ComputeError)?;
+        let dropped = speech_tokenizer
+            .decode_chunk(&tokens, &mut primed)
+            .and_then(|audio| audio.dim(0))
+            .map_err(TtsError::ComputeError)?;
+        debug_assert_eq!(dropped, frames * speech_tokenizer.upsample_factor());
+        info!(
+            "Voice prompt: {} transcript tokens, {frames} frames ({dropped} reference samples)",
+            text_ids.len()
+        );
+        Ok(IclPrompt {
+            text_ids,
+            codec_rows,
+            primed,
+        })
     }
 
     /// Normalize a user-supplied language tag to the key used in `codec_language_id`.
@@ -355,15 +557,27 @@ impl Qwen3TtsModel {
                 "max_tokens must be positive and temperature finite".into(),
             ));
         }
-        if request.reference_audio.is_some() || request.voice_embedding.is_some() {
-            return Err(TtsError::ModelError(
-                "Qwen3-TTS: voice cloning from reference audio is not yet implemented. \
-                 Use a named speaker via .with_voice() instead."
-                    .to_string(),
-            ));
+        if request.reference_audio.is_some() {
+            return Err(TtsError::ModelError(format!(
+                "Qwen3-TTS: cloning from raw reference audio is not implemented; {VOICE_EXPORT_HINT}"
+            )));
         }
 
-        if self.config.is_voice_design() {
+        if let Some(ref embedding) = request.voice_embedding {
+            // A cloned voice replaces any named speaker.
+            if !self.is_base() {
+                return Err(TtsError::ModelError(format!(
+                    "Qwen3-TTS: voice cloning needs the Base model, not {}",
+                    self.config.tts_model_type
+                )));
+            }
+            if embedding.model_type() != "qwen3-tts" {
+                return Err(TtsError::ModelError(format!(
+                    "Qwen3-TTS: voice embedding is for {}, not qwen3-tts",
+                    embedding.model_type()
+                )));
+            }
+        } else if self.config.is_voice_design() {
             if request.voice.is_some() {
                 return Err(TtsError::ModelError(
                     "Qwen3-TTS VoiceDesign uses `instruct` descriptions instead of named speakers."
@@ -401,19 +615,13 @@ impl Qwen3TtsModel {
     /// The caller should use the first 3 tokens as the role prefix and
     /// strip the last 5 tokens (closing template).
     fn tokenize_text(&self, text: &str) -> Result<Vec<u32>, TtsError> {
-        let tokenizer_path = self
-            .files
-            .tokenizer
-            .as_ref()
-            .expect("validated by resolve_files");
-        let tokenizer = TextTokenizer::from_asset(tokenizer_path)?;
 
         // Build the chat template: <|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n
         let template_text = format!(
             "<|im_start|>assistant\n{}<|im_end|>\n<|im_start|>assistant\n",
             text
         );
-        let token_ids = tokenizer.encode(&template_text)?;
+        let token_ids = self.tokenizer.encode(&template_text)?;
 
         if token_ids.len() < 8 {
             return Err(TtsError::ModelError(
@@ -431,15 +639,9 @@ impl Qwen3TtsModel {
             return Ok(None);
         };
 
-        let tokenizer_path = self
-            .files
-            .tokenizer
-            .as_ref()
-            .expect("validated by resolve_files");
-        let tokenizer = TextTokenizer::from_asset(tokenizer_path)?;
 
         let template_text = format!("<|im_start|>user\n{}<|im_end|>\n", instruct);
-        let token_ids = tokenizer.encode(&template_text)?;
+        let token_ids = self.tokenizer.encode(&template_text)?;
         info!("Tokenized {} instruction tokens", token_ids.len());
         Ok(Some(token_ids))
     }
@@ -449,6 +651,7 @@ impl Qwen3TtsModel {
         let speaker_id = request
             .voice
             .as_deref()
+            .filter(|_| request.voice_embedding.is_none())
             .and_then(|v| self.config.talker_config.spk_id.get(v).copied());
 
         let lang_str = self.normalize_language(request.language.as_deref().unwrap_or("auto"));
@@ -468,6 +671,10 @@ impl Qwen3TtsModel {
 
     /// Build the input embedding tensor from text tokens, speaker, and language.
     ///
+    /// With a voice prompt (in-context cloning), the reference transcript is
+    /// read before the text, and the reference frames follow codec_bos, so
+    /// that generation continues the reference audio with the text.
+    ///
     /// Returns `(input_embeds, trailing_text_hidden)`:
     /// - `input_embeds`: The combined text+codec embedding for the prefix.
     /// - `trailing_text_hidden`: Text embeddings to add at each generation step.
@@ -477,8 +684,9 @@ impl Qwen3TtsModel {
         &self,
         token_ids: &[u32],
         instruct_token_ids: Option<&[u32]>,
-        speaker_id: Option<u32>,
+        speaker: Option<Speaker>,
         language_id: Option<u32>,
+        icl: Option<&IclPrompt>,
     ) -> Result<(Tensor, Tensor), TtsError> {
         let talker = self.talker.lock().unwrap();
         let tc = &self.config.talker_config;
@@ -534,11 +742,21 @@ impl Qwen3TtsModel {
             }
         }
 
-        // Speaker position
-        if let Some(spk_id) = speaker_id {
-            text_ids.push(tts_pad);
-            codec_ids.push(spk_id);
-            codec_mask.push(1.0);
+        // Speaker position: a speaker's codec token, or an x-vector added
+        // to the embeddings below.
+        let xvector_position = text_ids.len();
+        match speaker {
+            Some(Speaker::Id(spk_id)) => {
+                text_ids.push(tts_pad);
+                codec_ids.push(spk_id);
+                codec_mask.push(1.0);
+            }
+            Some(Speaker::XVector(_)) => {
+                text_ids.push(tts_pad);
+                codec_ids.push(0);
+                codec_mask.push(0.0);
+            }
+            None => {}
         }
 
         // Codec pad position — reference uses tts_bos here (not tts_pad).
@@ -548,8 +766,10 @@ impl Qwen3TtsModel {
         codec_ids.push(codec_pad);
         codec_mask.push(1.0);
 
-        // Text content positions (each text token + codec_pad)
-        for &tok in text_content {
+        // Text content positions (each text token + codec_pad), after the
+        // voice prompt's transcript
+        let prompt_text = icl.map_or(&[][..], |icl| &icl.text_ids);
+        for &tok in prompt_text.iter().chain(text_content) {
             text_ids.push(tok);
             codec_ids.push(codec_pad);
             codec_mask.push(1.0);
@@ -569,8 +789,8 @@ impl Qwen3TtsModel {
         info!(
             "Input sequence: {} positions (role:3, think:{}, text:{}, special:3)",
             seq_len,
-            if language_id.is_some() { 4 } else { 3 } + if speaker_id.is_some() { 1 } else { 0 },
-            text_content.len(),
+            if language_id.is_some() { 4 } else { 3 } + if speaker.is_some() { 1 } else { 0 },
+            prompt_text.len() + text_content.len(),
         );
 
         // --- Compute embeddings ---
@@ -606,9 +826,25 @@ impl Qwen3TtsModel {
             .broadcast_mul(&mask_tensor)
             .map_err(TtsError::ComputeError)?;
 
-        let combined = text_embeds
+        let mut combined = text_embeds
             .add(&masked_codec)
             .map_err(TtsError::ComputeError)?;
+
+        if let Some(Speaker::XVector(xvector)) = speaker {
+            let at = xvector_position;
+            combined = Tensor::cat(
+                &[
+                    &combined.narrow(1, 0, at)?,
+                    &combined.narrow(1, at, 1)?.add(xvector)?,
+                    &combined.narrow(1, at + 1, seq_len - at - 1)?,
+                ],
+                1,
+            )
+            .map_err(TtsError::ComputeError)?;
+        }
+        if let Some(icl) = icl {
+            combined = Tensor::cat(&[&combined, &icl.codec_rows], 1).map_err(TtsError::ComputeError)?;
+        }
 
         let combined = if let Some(instruct_token_ids) =
             instruct_token_ids.filter(|tokens| !tokens.is_empty())
@@ -663,12 +899,21 @@ impl Qwen3TtsModel {
         full_input: &Tensor,
         trailing_text_hidden: &Tensor,
         request: &SynthesisRequest,
+        in_context: bool,
         mut on_frame: Option<&mut dyn FnMut(u32, &[u32]) -> candle_core::Result<()>>,
     ) -> Result<(Vec<u32>, Vec<Vec<u32>>), TtsError> {
         let max_tokens = request.max_tokens.unwrap_or(2048);
         // Default to 0.9 temperature with top-k 50 (matching reference)
         let temperature = request.temperature.unwrap_or(0.9);
         let top_k = 50;
+        let generation_config = || {
+            let config = TalkerGenerationConfig::new(max_tokens, temperature, top_k);
+            if in_context {
+                config.with_repetition_penalty(ICL_REPETITION_PENALTY, Some(ICL_REPETITION_WINDOW))
+            } else {
+                config
+            }
+        };
 
         // Build the code predictor callback if available.
         // The callback is called at each generation step with:
@@ -690,8 +935,7 @@ impl Qwen3TtsModel {
                 }
                 Ok(out)
             };
-            let generation_config = TalkerGenerationConfig::new(max_tokens, temperature, top_k)
-                .with_predict_and_sum_fn(&mut predict_fn);
+            let generation_config = generation_config().with_predict_and_sum_fn(&mut predict_fn);
             self.talker
                 .lock()
                 .unwrap()
@@ -701,11 +945,7 @@ impl Qwen3TtsModel {
             self.talker
                 .lock()
                 .unwrap()
-                .generate(
-                    full_input,
-                    trailing_text_hidden,
-                    TalkerGenerationConfig::new(max_tokens, temperature, top_k),
-                )
+                .generate(full_input, trailing_text_hidden, generation_config())
                 .map_err(TtsError::ComputeError)?
         };
 
@@ -792,8 +1032,13 @@ impl Qwen3TtsModel {
         Ok(codes)
     }
 
-    /// Decode codec tokens to audio samples via the speech tokenizer.
-    fn decode_to_audio(&self, all_codes: &Tensor) -> Result<Vec<f32>, TtsError> {
+    /// Decode codec tokens to audio samples via the speech tokenizer,
+    /// continuing a primed stream (a cloned voice's reference) if given.
+    fn decode_to_audio(
+        &self,
+        all_codes: &Tensor,
+        primed: Option<&DecoderStream>,
+    ) -> Result<Vec<f32>, TtsError> {
         let speech_tokenizer = self.speech_tokenizer.as_ref().ok_or_else(|| {
             TtsError::ModelError(
                 "Qwen3-TTS: speech tokenizer not loaded; cannot decode to audio. \
@@ -802,9 +1047,11 @@ impl Qwen3TtsModel {
             )
         })?;
 
-        let waveform = speech_tokenizer
-            .decode(all_codes)
-            .map_err(TtsError::ComputeError)?;
+        let waveform = match primed {
+            Some(primed) => speech_tokenizer.decode_chunk(all_codes, &mut primed.clone()),
+            None => speech_tokenizer.decode(all_codes),
+        }
+        .map_err(TtsError::ComputeError)?;
 
         // The decoder may produce BF16 on Metal/GPU — always cast to F32 for output.
         let waveform = waveform
@@ -813,6 +1060,41 @@ impl Qwen3TtsModel {
         let samples: Vec<f32> = waveform.to_vec1().map_err(TtsError::ComputeError)?;
 
         Ok(samples)
+    }
+}
+
+/// Identifies a voice embedding, to reuse its prepared form.
+fn voice_key(embedding: &VoiceEmbedding) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for value in embedding.data() {
+        value.to_bits().hash(&mut hasher);
+    }
+    embedding.shape().hash(&mut hasher);
+    if let Some(prompt) = embedding.prompt() {
+        prompt.codes.hash(&mut hasher);
+        prompt.text.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+impl VoiceCloning for Qwen3TtsModel {
+    /// The Base model clones voices exported by `scripts/qwen3_tts_voice.py`.
+    fn supports_voice_cloning(&self) -> bool {
+        self.is_base() && self.speech_tokenizer.is_some()
+    }
+
+    fn extract_voice(&self, _audio: &ReferenceAudio) -> Result<VoiceEmbedding, TtsError> {
+        Err(TtsError::ModelError(format!(
+            "Qwen3-TTS: the speaker and speech encoders are not ported; {VOICE_EXPORT_HINT}"
+        )))
+    }
+
+    fn synthesize_with_voice(
+        &self,
+        request: &SynthesisRequest,
+        voice: &VoiceEmbedding,
+    ) -> Result<crate::audio::AudioSamples, TtsError> {
+        self.synthesize(&request.clone().with_voice_embedding(voice.clone()))
     }
 }
 
@@ -828,5 +1110,65 @@ impl std::fmt::Debug for Qwen3TtsModel {
             .field("has_code_predictor", &self.code_predictor.is_some())
             .field("has_speech_tokenizer", &self.speech_tokenizer.is_some())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sentence decoded from a voice's primed stream equals the reference
+    /// and the sentence decoded whole, cut after the reference's samples.
+    /// Needs QWEN3_TTS_BASE (a Base model directory) and QWEN3_TTS_VOICE (a
+    /// voice JSON with a prompt); QWEN3_TTS_CPU runs it on the CPU in f32.
+    #[test]
+    #[ignore = "needs the Qwen3-TTS Base weights"]
+    fn primed_decode_matches_whole_decode() -> Result<(), TtsError> {
+        let (Some(dir), Some(voice)) = (
+            std::env::var_os("QWEN3_TTS_BASE"),
+            std::env::var_os("QWEN3_TTS_VOICE"),
+        ) else {
+            return Ok(());
+        };
+        let mut config =
+            TtsConfig::new(crate::ModelType::Qwen3Tts).with_model_path(dir.to_string_lossy().into_owned());
+        if std::env::var_os("QWEN3_TTS_CPU").is_some() {
+            config = config.with_device(crate::DeviceSelection::Cpu);
+        }
+        let model = Qwen3TtsModel::load(config)?;
+        let embedding = VoiceEmbedding::load(voice)?;
+        let reference = embedding.prompt().expect("voice has a prompt").codes.clone();
+        let request = SynthesisRequest::new("Hello.").with_voice_embedding(embedding);
+        let voice = model.prepare_voice(&request)?.expect("voice");
+        let primed = &voice.icl.as_ref().expect("in-context voice").primed;
+        assert_eq!(primed.frames(), reference.len());
+
+        // Stand-in generated frames: the reference's first ones, reversed.
+        let generated: Vec<Vec<u32>> = reference.iter().take(40).rev().cloned().collect();
+        let tokens = |frames: &[Vec<u32>]| -> candle_core::Result<Tensor> {
+            let flat: Vec<u32> = frames.iter().flatten().copied().collect();
+            Tensor::from_vec(flat, (1, frames.len(), 16), &model.device)?
+                .transpose(1, 2)?
+                .contiguous()
+        };
+        let speech_tokenizer = model.speech_tokenizer.as_ref().expect("speech tokenizer");
+        let whole: Vec<f32> = speech_tokenizer
+            .decode(&tokens(&[reference.clone(), generated.clone()].concat())?)?
+            .to_dtype(DType::F32)?
+            .to_vec1()?;
+        let cut = reference.len() * speech_tokenizer.upsample_factor();
+        let continued = model.decode_to_audio(&tokens(&generated)?, Some(primed))?;
+        assert_eq!(continued.len(), whole.len() - cut);
+
+        let (mut error, mut energy, mut max) = (0f64, 0f64, 0f32);
+        for (a, b) in continued.iter().zip(&whole[cut..]) {
+            error += ((a - b) as f64).powi(2);
+            energy += (*b as f64).powi(2);
+            max = max.max((a - b).abs());
+        }
+        let relative = (error / energy).sqrt();
+        println!("primed vs whole decode: max |diff| {max:.5}, relative RMS {relative:.5}");
+        assert!(relative < 0.02, "relative RMS difference {relative}");
+        Ok(())
     }
 }
