@@ -82,13 +82,25 @@ extern "C" __global__ void rms_norm(const bf16 *__restrict__ x, const bf16 *__re
 // are read once a frame, and the 4 MB of L2 could not keep them anyway),
 // with f32 accumulation. The output is rounded, then the bias or the
 // residual added and rounded again; `resid` may be `y` itself.
+//
+// Each warp loads its first weights before staging x, and the blocks
+// prefetch the first `next_bytes` of the next GEMV's weights into L2: the
+// weights do not depend on anything before, and a kernel's start, waiting
+// on DRAM and on the staging, is where a chain of GEMVs loses bandwidth.
 extern "C" __global__ void gemv(const bf16 *__restrict__ w, const bf16 *__restrict__ x, bf16 *y,
                                 int K, int N, int M, int x_stride, int y_stride,
                                 const bf16 *__restrict__ bias, const bf16 *resid,
                                 int resid_stride, int gated, const bf16 *__restrict__ norm,
-                                float eps) {
+                                float eps, const char *__restrict__ next, int next_bytes) {
     extern __shared__ uint4 shared_x[];
     bf16 *xs = (bf16 *)shared_x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < next_bytes / 128;
+         i += gridDim.x * blockDim.x)
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(next + (size_t)i * 128));
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const bf16 *wrow = w + (size_t)min(n, N - 1) * K;
+    const uint4 first = __ldcs((const uint4 *)(wrow + lane * 8));
     for (int m = 0; m < M; m++) {
         const bf16 *row = x + (size_t)m * x_stride;
         if (norm) {
@@ -114,14 +126,11 @@ extern "C" __global__ void gemv(const bf16 *__restrict__ w, const bf16 *__restri
         }
     }
     __syncthreads();
-    const int lane = threadIdx.x & 31;
-    const int n = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (n >= N) return;
-    const bf16 *wrow = w + (size_t)n * K;
     float acc0 = 0.f, acc1 = 0.f;
     for (int k = lane * 8; k < K; k += 256) {
         float wf[8], x0[8];
-        unpack8(__ldcs((const uint4 *)(wrow + k)), wf);
+        unpack8(k == lane * 8 ? first : __ldcs((const uint4 *)(wrow + k)), wf);
         unpack8(*(const uint4 *)(xs + k), x0);
 #pragma unroll
         for (int i = 0; i < 8; i++) acc0 += wf[i] * x0[i];

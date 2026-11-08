@@ -39,6 +39,8 @@ const CP_POSITIONS: usize = 16;
 /// Key splits of the talker's attention: its keys are the whole utterance.
 const TALKER_SPLITS: u32 = 16;
 const GEMV_WARPS: u32 = 8;
+/// How much of the next GEMV's weights a GEMV prefetches into L2.
+const PREFETCH_BYTES: i32 = 1 << 20;
 const SAMPLE_THREADS: u32 = 1024;
 const MAX_VOCAB: usize = 4096;
 
@@ -436,7 +438,8 @@ impl CudaFrames {
     }
 
     /// y = w x (+ bias | + resid) for `m` rows, x first RMS-normalized
-    /// with `norm` (if not 0) or gated; see the kernel.
+    /// with `norm` (if not 0) or gated, prefetching the start of `next`
+    /// (if not 0), the weights the next GEMV reads; see the kernel.
     #[allow(clippy::too_many_arguments)]
     fn gemv(
         &self,
@@ -449,6 +452,7 @@ impl CudaFrames {
         bias: u64,
         resid: u64,
         input: Input,
+        next: u64,
     ) -> Result<()> {
         let (k32, n32, m32) = (k as i32, n as i32, m as i32);
         let (gated, norm, eps) = match input {
@@ -462,14 +466,20 @@ impl CudaFrames {
         let mut b = self.stream.launch_builder(&self.k.gemv);
         b.arg(&w).arg(&x).arg(&y).arg(&k32).arg(&n32).arg(&m32);
         b.arg(&x_stride).arg(&n32).arg(&bias).arg(&resid).arg(&n32);
-        b.arg(&gated).arg(&norm).arg(&eps);
+        let next_bytes = if next == 0 { 0 } else { PREFETCH_BYTES };
+        b.arg(&gated)
+            .arg(&norm)
+            .arg(&eps)
+            .arg(&next)
+            .arg(&next_bytes);
         unsafe { b.launch(Self::config((blocks, 1, 1), GEMV_WARPS * 32, shared)) }.w()?;
         Ok(())
     }
 
     /// Runs `rows` tokens through a stack, from its `x` (in place), the
-    /// first at position `*pos + base` (`pos` 0 for none).
-    fn forward(&self, s: &Stack, rows: usize, pos: u64, base: i32) -> Result<()> {
+    /// first at position `*pos + base` (`pos` 0 for none); `after` is the
+    /// next weights read after the stack, to prefetch.
+    fn forward(&self, s: &Stack, rows: usize, pos: u64, base: i32, after: u64) -> Result<()> {
         let st = &self.stream;
         let x = slice_address(&s.x, st);
         let (qkv, q, attn) = (
@@ -492,7 +502,7 @@ impl CudaFrames {
             let v_cache = s.cache_layer(&s.v_cache, i, st);
             let normed = Input::Normed(layer.input_norm, s.eps);
             let (w, bias) = (layer.qkv, layer.qkv_bias);
-            self.gemv(w, x, qkv, s.hidden, qkv_dim, rows, bias, 0, normed)?;
+            self.gemv(w, x, qkv, s.hidden, qkv_dim, rows, bias, 0, normed, layer.o)?;
             let mut b = st.launch_builder(&self.k.qk_norm_rope);
             b.arg(&qkv)
                 .arg(&qkv_stride)
@@ -529,12 +539,27 @@ impl CudaFrames {
                 ))
             }
             .w()?;
-            self.gemv(layer.o, attn, x, q_dim, s.hidden, rows, 0, x, Input::Plain)?;
+            let (o, plain) = (layer.o, Input::Plain);
+            self.gemv(
+                o,
+                attn,
+                x,
+                q_dim,
+                s.hidden,
+                rows,
+                0,
+                x,
+                plain,
+                layer.gate_up,
+            )?;
             let normed = Input::Normed(layer.post_norm, s.eps);
             let (w, inter) = (layer.gate_up, 2 * s.inter);
-            self.gemv(w, x, gate_up, s.hidden, inter, rows, 0, 0, normed)?;
+            self.gemv(
+                w, x, gate_up, s.hidden, inter, rows, 0, 0, normed, layer.down,
+            )?;
             let (w, gated) = (layer.down, Input::Gated);
-            self.gemv(w, gate_up, x, s.inter, s.hidden, rows, 0, x, gated)?;
+            let next = s.layers.get(i + 1).map_or(after, |next| next.qkv);
+            self.gemv(w, gate_up, x, s.inter, s.hidden, rows, 0, x, gated, next)?;
         }
         Ok(())
     }
@@ -606,7 +631,20 @@ impl CudaFrames {
 
         // Group 0.
         let (w, vocab) = (self.codec_head, self.talker_vocab);
-        self.gemv(w, cp_in, logits, hidden, vocab, 1, 0, 0, Input::Plain)?;
+        // The code predictor's first weights, read after each head.
+        let cp_first = self.cp_proj.map_or(c.layers[0].qkv, |(w, _)| w);
+        self.gemv(
+            w,
+            cp_in,
+            logits,
+            hidden,
+            vocab,
+            1,
+            0,
+            0,
+            Input::Plain,
+            cp_first,
+        )?;
         self.sample(logits, self.talker_vocab, true, 0)?;
         self.embed(
             self.codec_embed,
@@ -622,15 +660,32 @@ impl CudaFrames {
             let (input, rows) = if group == 1 { (cp_in, 2) } else { (emb, 1) };
             match self.cp_proj {
                 Some((w, bias)) => {
-                    self.gemv(w, input, cx, hidden, c.hidden, rows, bias, 0, Input::Plain)?
+                    let (plain, next) = (Input::Plain, c.layers[0].qkv);
+                    self.gemv(w, input, cx, hidden, c.hidden, rows, bias, 0, plain, next)?
                 }
                 None => self.copy_rows(input, cx, rows * hidden)?,
             }
             let base = if group == 1 { 0 } else { group as i32 };
-            self.forward(c, rows, 0, base)?;
+            self.forward(c, rows, 0, base, self.cp_heads[group - 1])?;
             let last = cx + 2 * ((rows - 1) * c.hidden) as u64;
             let (w, normed) = (self.cp_heads[group - 1], Input::Normed(c.final_norm, c.eps));
-            self.gemv(w, last, logits, c.hidden, self.cp_vocab, 1, 0, 0, normed)?;
+            let next = if group + 1 < FRAME_CODES {
+                cp_first
+            } else {
+                t.layers[0].qkv
+            };
+            self.gemv(
+                w,
+                last,
+                logits,
+                c.hidden,
+                self.cp_vocab,
+                1,
+                0,
+                0,
+                normed,
+                next,
+            )?;
             self.sample(logits, self.cp_vocab, false, group as i32)?;
             self.embed(self.cp_embeds[group - 1], hidden, emb, summed, 2)?;
         }
@@ -643,7 +698,7 @@ impl CudaFrames {
         b.arg(&summed).arg(&trailing).arg(&state).arg(&n).arg(&tx);
         unsafe { b.launch(Self::config((4, 1, 1), 256, 0)) }.w()?;
         // `pos` is the state's first field.
-        self.forward(t, 1, state, 0)?;
+        self.forward(t, 1, state, 0, self.codec_head)?;
         self.rms_norm(tx, t.final_norm, cp_in, hidden, 1, t.eps)?;
         let mut b = st.launch_builder(&self.k.advance);
         b.arg(&state);
