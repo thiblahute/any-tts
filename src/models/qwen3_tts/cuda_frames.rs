@@ -92,6 +92,7 @@ struct Kernels {
     qk_norm_rope: CudaFunction,
     attn_partial: CudaFunction,
     attn_combine: CudaFunction,
+    short_attention: CudaFunction,
     causal_softmax: CudaFunction,
     sample: CudaFunction,
     embed: CudaFunction,
@@ -324,6 +325,7 @@ impl CudaFrames {
             qk_norm_rope: kernel(cuda, "qk_norm_rope")?,
             attn_partial: kernel(cuda, "attn_partial")?,
             attn_combine: kernel(cuda, "attn_combine")?,
+            short_attention: kernel(cuda, "short_attention")?,
             causal_softmax: kernel(cuda, "causal_softmax")?,
             sample: kernel(cuda, "sample")?,
             embed: kernel(cuda, "embed")?,
@@ -485,7 +487,8 @@ impl CudaFrames {
     /// projections: q and k normalized and rotated, k and v into the
     /// caches at `*pos + base` on, then attention over each token's causal
     /// range in `splits` key splits (partials in `ml`, `acc`), to `out`;
-    /// no attention with no splits.
+    /// no attention with no splits. At static positions with one split
+    /// (the code predictor), one kernel does it all.
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
@@ -505,6 +508,26 @@ impl CudaFrames {
         let (heads, kv_heads, cap) = (s.heads as i32, s.kv_heads as i32, s.cap as i32);
         let qkv_stride = ((s.heads + 2 * s.kv_heads) * HEAD_DIM) as i32;
         let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        if pos == 0 && splits == 1 && rows * (s.heads / s.kv_heads) <= 8 && s.cap <= 32 {
+            // The code predictor's few keys: all of it in one kernel.
+            let rows = rows as i32;
+            let mut b = st.launch_builder(&self.k.short_attention);
+            b.arg(&qkv)
+                .arg(&qkv_stride)
+                .arg(&l.q_norm)
+                .arg(&l.k_norm)
+                .arg(&s.eps);
+            b.arg(&s.rope_cos).arg(&s.rope_sin).arg(&base).arg(&rows);
+            b.arg(&k_cache)
+                .arg(&v_cache)
+                .arg(&cap)
+                .arg(&heads)
+                .arg(&kv_heads);
+            b.arg(&scale).arg(&out);
+            let grid = (s.kv_heads as u32, 1, 1);
+            unsafe { b.launch(Self::config(grid, 256, 0)) }.w()?;
+            return Ok(());
+        }
         let mut b = st.launch_builder(&self.k.qk_norm_rope);
         b.arg(&qkv).arg(&qkv_stride).arg(&l.q_norm).arg(&l.k_norm);
         b.arg(&s.eps)

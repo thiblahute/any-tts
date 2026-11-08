@@ -54,6 +54,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "fancy-regex 0.17.0",
+ "half",
  "hound",
  "kana2phone",
  "lindera",

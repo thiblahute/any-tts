@@ -196,6 +196,105 @@ extern "C" __global__ void qk_norm_rope(const bf16 *__restrict__ qkv, int qkv_st
     dst[t + 64] = to_bf16(rnd(a * s) + rnd(b * c));
 }
 
+// The code predictor's attention in one kernel, its keys being few (at
+// most SHORT_KEYS, 32): for kv head blockIdx.x and `rows` new tokens at positions base..,
+// warp r < rows normalizes and rotates token r's key and the next `rows`
+// warps copy the values, into the caches; then warp (r, g) takes query
+// head g of the group for token r, normalizes and rotates it, and attends
+// over keys 0..base + r with an online softmax. Lane l holds dims l,
+// l + 32, l + 64 and l + 96, rotation pairs (l, l + 64) and (l + 32, l + 96).
+__device__ __forceinline__ void norm_rope4(float *v, const bf16 *__restrict__ norm, float eps,
+                                           const bf16 *__restrict__ cos,
+                                           const bf16 *__restrict__ sin, int p, int lane) {
+    if (norm) {
+        const float scale =
+            rsqrtf(warp_sum(v[0] * v[0] + v[1] * v[1] + v[2] * v[2] + v[3] * v[3]) / HEAD_DIM + eps);
+#pragma unroll
+        for (int i = 0; i < 4; i++) v[i] = rnd(scale * v[i] * f32(norm[lane + 32 * i]));
+    }
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const float c = f32(cos[(size_t)p * HEAD_DIM + lane + 32 * i]);
+        const float s = f32(sin[(size_t)p * HEAD_DIM + lane + 32 * i]);
+        const float a = v[i], b = v[i + 2];
+        v[i] = rnd(rnd(a * c) - rnd(b * s));
+        v[i + 2] = rnd(rnd(a * s) + rnd(b * c));
+    }
+}
+
+#define SHORT_KEYS 32
+
+extern "C" __global__ void short_attention(const bf16 *__restrict__ qkv, int qkv_stride,
+                                           const bf16 *__restrict__ q_norm,
+                                           const bf16 *__restrict__ k_norm, float eps,
+                                           const bf16 *__restrict__ cos,
+                                           const bf16 *__restrict__ sin, int base, int rows,
+                                           bf16 *__restrict__ k_cache, bf16 *__restrict__ v_cache,
+                                           int cap, int heads, int kv_heads, float scale,
+                                           bf16 *__restrict__ out) {
+    // The head's keys and values, staged once: every query reads them all.
+    __shared__ float ks[SHORT_KEYS][HEAD_DIM + 1];
+    __shared__ float vs[SHORT_KEYS][HEAD_DIM];
+    const int kvh = blockIdx.x, group = heads / kv_heads, len = base + rows;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    bf16 *keys = k_cache + (size_t)kvh * cap * HEAD_DIM;
+    bf16 *values = v_cache + (size_t)kvh * cap * HEAD_DIM;
+    for (int i = threadIdx.x; i < base * HEAD_DIM; i += blockDim.x) {
+        ks[i / HEAD_DIM][i % HEAD_DIM] = f32(keys[i]);
+        vs[i / HEAD_DIM][i % HEAD_DIM] = f32(values[i]);
+    }
+    if (warp < 2 * rows) {
+        const int r = warp % rows, p = base + r;
+        const bool is_v = warp >= rows;
+        const bf16 *src = qkv + (size_t)r * qkv_stride +
+                          (size_t)(heads + (is_v ? kv_heads : 0) + kvh) * HEAD_DIM;
+        float v[4];
+#pragma unroll
+        for (int i = 0; i < 4; i++) v[i] = f32(src[lane + 32 * i]);
+        if (!is_v) norm_rope4(v, k_norm, eps, cos, sin, p, lane);
+        bf16 *dst = (is_v ? values : keys) + (size_t)p * HEAD_DIM;
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            const bf16 b = to_bf16(v[i]);
+            dst[lane + 32 * i] = b;
+            (is_v ? vs[p] : ks[p])[lane + 32 * i] = f32(b);
+        }
+    }
+    __syncthreads();
+    if (warp >= rows * group) return;
+    const int r = warp / group, h = kvh * group + warp % group, p = base + r;
+    const bf16 *src = qkv + (size_t)r * qkv_stride + (size_t)h * HEAD_DIM;
+    __shared__ float qs[8][HEAD_DIM];
+    float q[4];
+#pragma unroll
+    for (int i = 0; i < 4; i++) q[i] = f32(src[lane + 32 * i]);
+    norm_rope4(q, q_norm, eps, cos, sin, p, lane);
+#pragma unroll
+    for (int i = 0; i < 4; i++) qs[warp][lane + 32 * i] = q[i];
+    __syncwarp();
+    // Lane j scores key j; then softmax across the lanes.
+    float d = -INFINITY;
+    if (lane <= p) {
+        d = 0.f;
+#pragma unroll 8
+        for (int i = 0; i < HEAD_DIM; i++) d += qs[warp][i] * ks[lane][i];
+        d *= scale;
+    }
+    float mx = d;
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    const float e = lane <= p ? __expf(d - mx) : 0.f;
+    const float l = warp_sum(e);
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int j = 0; j <= p; j++) {
+        const float w = __shfl_sync(0xffffffffu, e, j);
+#pragma unroll
+        for (int i = 0; i < 4; i++) acc[i] += w * vs[j][lane + 32 * i];
+    }
+    bf16 *dst = out + ((size_t)r * heads + h) * HEAD_DIM;
+#pragma unroll
+    for (int i = 0; i < 4; i++) dst[lane + 32 * i] = to_bf16(acc[i] / l);
+}
+
 #define ATTN_WARPS 4
 #define MAX_GROUP 4
 
