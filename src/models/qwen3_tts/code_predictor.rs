@@ -27,8 +27,9 @@ const SUBTALKER_TEMPERATURE: f64 = 0.9;
 
 /// The Code Predictor sub-model.
 pub struct CodePredictor {
-    /// Project from Talker hidden size to Code Predictor hidden size.
-    input_proj: Linear,
+    /// Project from Talker hidden size to Code Predictor hidden size; the
+    /// 0.6B checkpoints, whose sizes match, have none.
+    input_proj: Option<Linear>,
     /// Per-group codec embeddings: group_embeds[g] for groups 1..N-1.
     group_embeds: Vec<Embedding>,
     /// Transformer layers (smaller than the Talker).
@@ -71,11 +72,15 @@ impl CodePredictor {
 
         // Projection from Talker hidden → Code Predictor hidden
         // Actual name: talker.code_predictor.small_to_mtp_projection.{weight,bias}
-        let input_proj = crate::layers::metal_ops::linear(
-            talker_hidden_size,
-            config.hidden_size,
-            vb.pp("small_to_mtp_projection"),
-        )?;
+        let input_proj = if talker_hidden_size == config.hidden_size {
+            None
+        } else {
+            Some(crate::layers::metal_ops::linear(
+                talker_hidden_size,
+                config.hidden_size,
+                vb.pp("small_to_mtp_projection"),
+            )?)
+        };
 
         // Per-group embeddings (for groups 1..N-1)
         // Actual name: talker.code_predictor.model.codec_embedding.N.weight
@@ -140,6 +145,14 @@ impl CodePredictor {
         })
     }
 
+    /// Bring talker-space vectors to the Code Predictor's hidden size.
+    fn project(&self, x: &Tensor) -> Result<Tensor> {
+        match &self.input_proj {
+            Some(proj) => proj.forward(x),
+            None => Ok(x.clone()),
+        }
+    }
+
     /// Embed codes of codebook `group` (1..N-1) in the talker's hidden space.
     pub fn embed_group(&self, group: usize, token_ids: &Tensor) -> Result<Tensor> {
         self.group_embeds[group - 1].forward(token_ids)
@@ -185,7 +198,7 @@ impl CodePredictor {
         let prefill = Tensor::cat(&[&past_hidden_3d, g0_embed], 1)?; // (1, 2, H)
 
         // Project to CP hidden size
-        let prefill = self.input_proj.forward(&prefill)?; // (1, 2, cp_hidden)
+        let prefill = self.project(&prefill)?; // (1, 2, cp_hidden)
 
         let mut hidden = prefill;
 
@@ -233,7 +246,7 @@ impl CodePredictor {
             let prev_embed = self.group_embeds[embed_idx].forward(&prev_tok_tensor)?;
 
             // Project and run one step with real RoPE
-            let step_input = self.input_proj.forward(&prev_embed)?;
+            let step_input = self.project(&prev_embed)?;
             let mut h = step_input;
             for layer in &mut self.layers {
                 h = layer.forward(&h, &self.rope_cos, &self.rope_sin, pos, None)?;

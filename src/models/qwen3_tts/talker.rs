@@ -69,7 +69,7 @@ pub struct TalkerLm {
     /// Codec token embedding (codec_vocab_size × hidden_size).
     codec_embed: Embedding,
     /// Projects text embeddings into the shared hidden space.
-    /// Two-layer MLP: text_hidden_size → hidden_size → hidden_size.
+    /// Two-layer MLP: text_hidden_size → text_hidden_size → hidden_size.
     text_proj_fc1: Linear,
     text_proj_fc2: Linear,
     /// Transformer decoder layers.
@@ -124,11 +124,11 @@ impl TalkerLm {
         // Text projection MLP — weights under `talker.text_projection.*`
         let text_proj_fc1 = crate::layers::metal_ops::linear(
             config.text_hidden_size,
-            config.hidden_size,
+            config.text_hidden_size,
             vb.pp("text_projection.linear_fc1"),
         )?;
         let text_proj_fc2 = crate::layers::metal_ops::linear(
-            config.hidden_size,
+            config.text_hidden_size,
             config.hidden_size,
             vb.pp("text_projection.linear_fc2"),
         )?;
