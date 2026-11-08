@@ -437,21 +437,6 @@ impl TalkerLm {
         Ok((generated, all_group_tokens))
     }
 
-    /// Run a prompt through the layers, filling their caches, and return
-    /// the last position's normed hidden state, (1, hidden).
-    #[cfg(feature = "cuda")]
-    pub fn prefill(&mut self, text_embeds: &Tensor) -> Result<Tensor> {
-        self.clear_cache();
-        let h = self.forward_prenorm(text_embeds, 0)?;
-        let h = self.apply_norm(&h)?;
-        h.i((.., h.dim(1)? - 1, ..))
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn caches(&self) -> impl Iterator<Item = Option<(Tensor, Tensor)>> + '_ {
-        self.layers.iter().map(TransformerBlock::cache_state)
-    }
-
     #[cfg(feature = "cuda")]
     pub fn blocks(&self) -> impl Iterator<Item = &TransformerBlock> {
         self.layers.iter()

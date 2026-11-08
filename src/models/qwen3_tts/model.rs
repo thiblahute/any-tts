@@ -966,12 +966,12 @@ impl Qwen3TtsModel {
         let on_frame = match &self.cuda_frames {
             Some(frames) => {
                 let sampling = generation_config().frame_sampling();
-                let mut talker = self.talker.lock().unwrap();
+                let talker = self.talker.lock().unwrap();
                 let (codec_tokens_g0, group_tokens) = frames
                     .lock()
                     .unwrap()
                     .generate(
-                        &mut talker,
+                        &talker,
                         full_input,
                         trailing_text_hidden,
                         sampling,

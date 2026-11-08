@@ -15,6 +15,7 @@
 //! the same kernels one by one instead of through the graph, and
 //! `QWEN3_TTS_SEED` makes the sampling reproducible.
 
+use candle_core::cuda::cudarc::cublas::CudaBlas;
 use candle_core::cuda::cudarc::driver::{
     sys, CudaFunction, CudaGraph, CudaSlice, CudaStream, DevicePtr, LaunchConfig, PushKernelArg,
 };
@@ -95,7 +96,7 @@ struct Kernels {
     embed: CudaFunction,
     talker_input: CudaFunction,
     copy_rows: CudaFunction,
-    copy_cache: CudaFunction,
+    silu_mul: CudaFunction,
     advance: CudaFunction,
 }
 
@@ -141,6 +142,7 @@ unsafe impl Send for Graph {}
 
 pub struct CudaFrames {
     stream: Arc<CudaStream>,
+    blas: Arc<CudaBlas>,
     k: Kernels,
     mode: Mode,
     /// Weights the raw pointers below point into.
@@ -325,7 +327,7 @@ impl CudaFrames {
             embed: kernel(cuda, "embed")?,
             talker_input: kernel(cuda, "talker_input")?,
             copy_rows: kernel(cuda, "copy_rows")?,
-            copy_cache: kernel(cuda, "copy_cache")?,
+            silu_mul: kernel(cuda, "silu_mul")?,
             advance: kernel(cuda, "advance")?,
         };
         let mut keep = Vec::new();
@@ -417,6 +419,7 @@ impl CudaFrames {
             graph: None,
             talker: talker_stack,
             cp: cp_stack,
+            blas: cuda.cublas_handle(),
             stream,
         }))
     }
@@ -476,6 +479,148 @@ impl CudaFrames {
         Ok(())
     }
 
+    /// Layer `layer`'s attention for `rows` tokens from their q/k/v
+    /// projections: q and k normalized and rotated, k and v into the
+    /// caches at `*pos + base` on, then attention over each token's causal
+    /// range in `splits` key splits (partials in `ml`, `acc`), to `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention(
+        &self,
+        s: &Stack,
+        layer: usize,
+        rows: usize,
+        (pos, base): (u64, i32),
+        qkv: u64,
+        q: u64,
+        out: u64,
+        (ml, acc, splits): (u64, u64, u32),
+    ) -> Result<()> {
+        let st = &self.stream;
+        let l = &s.layers[layer];
+        let k_cache = s.cache_layer(&s.k_cache, layer, st);
+        let v_cache = s.cache_layer(&s.v_cache, layer, st);
+        let (heads, kv_heads, cap) = (s.heads as i32, s.kv_heads as i32, s.cap as i32);
+        let qkv_stride = ((s.heads + 2 * s.kv_heads) * HEAD_DIM) as i32;
+        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
+        let mut b = st.launch_builder(&self.k.qk_norm_rope);
+        b.arg(&qkv).arg(&qkv_stride).arg(&l.q_norm).arg(&l.k_norm);
+        b.arg(&s.eps)
+            .arg(&s.rope_cos)
+            .arg(&s.rope_sin)
+            .arg(&pos)
+            .arg(&base);
+        b.arg(&q).arg(&k_cache).arg(&v_cache).arg(&cap);
+        b.arg(&heads).arg(&kv_heads);
+        let grid = ((s.heads + 2 * s.kv_heads) as u32, rows as u32, 1);
+        unsafe { b.launch(Self::config(grid, (HEAD_DIM / 2) as u32, 0)) }.w()?;
+        let mut b = st.launch_builder(&self.k.attn_partial);
+        b.arg(&q).arg(&k_cache).arg(&v_cache).arg(&pos).arg(&base);
+        b.arg(&cap)
+            .arg(&heads)
+            .arg(&kv_heads)
+            .arg(&scale)
+            .arg(&ml)
+            .arg(&acc);
+        let grid = (s.kv_heads as u32, splits, rows as u32);
+        unsafe { b.launch(Self::config(grid, HEAD_DIM as u32, 0)) }.w()?;
+        let splits = splits as i32;
+        let mut b = st.launch_builder(&self.k.attn_combine);
+        b.arg(&ml).arg(&acc).arg(&out).arg(&heads).arg(&splits);
+        let grid = (s.heads as u32, rows as u32, 1);
+        unsafe { b.launch(Self::config(grid, HEAD_DIM as u32, 0)) }.w()?;
+        Ok(())
+    }
+
+    /// y (m x n) = x (m x k) w^T, w being n x k, all row-major bf16, plus y
+    /// itself when `accumulate`; through cuBLAS, for the prompt's rows.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm(
+        &self,
+        w: u64,
+        x: u64,
+        y: u64,
+        m: usize,
+        k: usize,
+        n: usize,
+        accumulate: bool,
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::cublas::{result::gemm_ex, sys as blas};
+        let (alpha, beta) = (1f32, if accumulate { 1f32 } else { 0f32 });
+        let bf16 = blas::cudaDataType::CUDA_R_16BF;
+        let (m, k, n) = (m as i32, k as i32, n as i32);
+        // Column-major: y^T (n x m) = w (n x k, w^T stored) x^T (k x m).
+        unsafe {
+            gemm_ex(
+                *self.blas.handle(),
+                blas::cublasOperation_t::CUBLAS_OP_T,
+                blas::cublasOperation_t::CUBLAS_OP_N,
+                n,
+                m,
+                k,
+                &alpha as *const f32 as *const _,
+                w as *const _,
+                bf16,
+                k,
+                x as *const _,
+                bf16,
+                k,
+                &beta as *const f32 as *const _,
+                y as *mut _,
+                bf16,
+                n,
+                blas::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+            )
+        }
+        .map_err(|error| candle_core::Error::Msg(format!("cuBLAS: {error:?}")))
+    }
+
+    /// Runs a prompt (`rows` embeddings at `embeds`) through the talker
+    /// from position 0, filling its caches, and leaves the last position's
+    /// normed hidden state where a frame starts. The projections go
+    /// through cuBLAS, a few hundred rows at once, the rest through the
+    /// frames' kernels.
+    fn prefill(&self, embeds: u64, rows: usize) -> Result<()> {
+        let st = &self.stream;
+        let t = &self.talker;
+        if t.layers.iter().any(|layer| layer.qkv_bias != 0) {
+            candle_core::bail!("CUDA frames' prefill has no q/k/v bias")
+        }
+        let (hidden, inter) = (t.hidden, t.inter);
+        let qkv_dim = (t.heads + 2 * t.kv_heads) * HEAD_DIM;
+        let q_dim = t.heads * HEAD_DIM;
+        let x = st.alloc_zeros::<u16>(rows * hidden).w()?;
+        let h = st.alloc_zeros::<u16>(rows * hidden).w()?;
+        let qkv = st.alloc_zeros::<u16>(rows * qkv_dim).w()?;
+        let q = st.alloc_zeros::<u16>(rows * q_dim).w()?;
+        let attn = st.alloc_zeros::<u16>(rows * q_dim).w()?;
+        let gate_up = st.alloc_zeros::<u16>(rows * 2 * inter).w()?;
+        let act = st.alloc_zeros::<u16>(rows * inter).w()?;
+        let ml = st.alloc_zeros::<f32>(rows * t.heads * 2).w()?;
+        let acc = st.alloc_zeros::<f32>(rows * q_dim).w()?;
+        let [x, h, qkv, q, attn, gate_up, act] =
+            [&x, &h, &qkv, &q, &attn, &gate_up, &act].map(|b| slice_address(b, st));
+        let (ml, acc) = (slice_address(&ml, st), slice_address(&acc, st));
+        self.copy_rows(embeds, x, rows * hidden)?;
+        for (i, layer) in t.layers.iter().enumerate() {
+            self.rms_norm(x, layer.input_norm, h, hidden, rows, t.eps)?;
+            self.gemm(layer.qkv, h, qkv, rows, hidden, qkv_dim, false)?;
+            self.attention(t, i, rows, (0, 0), qkv, q, attn, (ml, acc, 1))?;
+            self.gemm(layer.o, attn, x, rows, q_dim, hidden, true)?;
+            self.rms_norm(x, layer.post_norm, h, hidden, rows, t.eps)?;
+            self.gemm(layer.gate_up, h, gate_up, rows, hidden, 2 * inter, false)?;
+            let (n, inter32) = ((rows * inter) as i32, inter as i32);
+            let mut b = st.launch_builder(&self.k.silu_mul);
+            b.arg(&gate_up).arg(&act).arg(&inter32).arg(&n);
+            let blocks = (n as u32).div_ceil(256).min(1024);
+            unsafe { b.launch(Self::config((blocks, 1, 1), 256, 0)) }.w()?;
+            self.gemm(layer.down, act, x, rows, inter, hidden, true)?;
+        }
+        let last = x + 2 * ((rows - 1) * hidden) as u64;
+        let cp_in = slice_address(&self.cp_in, st);
+        self.rms_norm(last, t.final_norm, cp_in, hidden, 1, t.eps)
+    }
+
     /// Runs `rows` tokens through a stack, from its `x` (in place), the
     /// first at position `*pos + base` (`pos` 0 for none); `after` is the
     /// next weights read after the stack, to prefetch.
@@ -494,51 +639,12 @@ impl CudaFrames {
         );
         let qkv_dim = (s.heads + 2 * s.kv_heads) * HEAD_DIM;
         let q_dim = s.heads * HEAD_DIM;
-        let (heads, kv_heads, cap) = (s.heads as i32, s.kv_heads as i32, s.cap as i32);
-        let qkv_stride = qkv_dim as i32;
-        let scale = 1.0f32 / (HEAD_DIM as f32).sqrt();
         for (i, layer) in s.layers.iter().enumerate() {
-            let k_cache = s.cache_layer(&s.k_cache, i, st);
-            let v_cache = s.cache_layer(&s.v_cache, i, st);
             let normed = Input::Normed(layer.input_norm, s.eps);
             let (w, bias) = (layer.qkv, layer.qkv_bias);
             self.gemv(w, x, qkv, s.hidden, qkv_dim, rows, bias, 0, normed, layer.o)?;
-            let mut b = st.launch_builder(&self.k.qk_norm_rope);
-            b.arg(&qkv)
-                .arg(&qkv_stride)
-                .arg(&layer.q_norm)
-                .arg(&layer.k_norm)
-                .arg(&s.eps);
-            b.arg(&s.rope_cos).arg(&s.rope_sin).arg(&pos).arg(&base);
-            b.arg(&q)
-                .arg(&k_cache)
-                .arg(&v_cache)
-                .arg(&cap)
-                .arg(&heads)
-                .arg(&kv_heads);
-            let grid = ((s.heads + 2 * s.kv_heads) as u32, rows as u32, 1);
-            unsafe { b.launch(Self::config(grid, (HEAD_DIM / 2) as u32, 0)) }.w()?;
-            let mut b = st.launch_builder(&self.k.attn_partial);
-            b.arg(&q)
-                .arg(&k_cache)
-                .arg(&v_cache)
-                .arg(&pos)
-                .arg(&base)
-                .arg(&cap);
-            b.arg(&heads).arg(&kv_heads).arg(&scale).arg(&ml).arg(&acc);
-            let grid = (s.kv_heads as u32, s.splits, rows as u32);
-            unsafe { b.launch(Self::config(grid, HEAD_DIM as u32, 0)) }.w()?;
-            let splits = s.splits as i32;
-            let mut b = st.launch_builder(&self.k.attn_combine);
-            b.arg(&ml).arg(&acc).arg(&attn).arg(&heads).arg(&splits);
-            unsafe {
-                b.launch(Self::config(
-                    (s.heads as u32, rows as u32, 1),
-                    HEAD_DIM as u32,
-                    0,
-                ))
-            }
-            .w()?;
+            let parts = (ml, acc, s.splits);
+            self.attention(s, i, rows, (pos, base), qkv, q, attn, parts)?;
             let (o, plain) = (layer.o, Input::Plain);
             self.gemv(
                 o,
@@ -734,7 +840,7 @@ impl CudaFrames {
     /// `on_frame`. Returns the group-0 codes and the other groups' per frame.
     pub fn generate(
         &mut self,
-        talker: &mut TalkerLm,
+        talker: &TalkerLm,
         text_embeds: &Tensor,
         trailing_text_hidden: &Tensor,
         sampling: FrameSampling,
@@ -749,34 +855,10 @@ impl CudaFrames {
         }
         self.reserve(prefix + max_tokens, trailing_rows)?;
 
-        let hidden = talker.prefill(text_embeds)?.contiguous()?;
         let st = self.stream.clone();
+        let embeds = text_embeds.contiguous()?;
+        self.prefill(address(&embeds, &st)?, prefix)?;
         let t = &self.talker;
-        for (i, cache) in talker.caches().enumerate() {
-            let Some((k, v)) = cache else {
-                candle_core::bail!("talker prefill left no cache")
-            };
-            let (_, kv_heads, len, dim) = k.dims4()?;
-            if kv_heads != t.kv_heads || dim != HEAD_DIM || len != prefix {
-                candle_core::bail!("talker cache shape {:?} unexpected", k.dims())
-            }
-            for (src, dst) in [(&k, &t.k_cache), (&v, &t.v_cache)] {
-                let src_stride = src.stride()[1] as i64;
-                let dst_stride = (t.cap * HEAD_DIM) as i64;
-                let (src, dst) = (address(src, &st)?, t.cache_layer(dst, i, &st));
-                let n = (len * HEAD_DIM) as i32;
-                let mut b = st.launch_builder(&self.k.copy_cache);
-                b.arg(&src)
-                    .arg(&src_stride)
-                    .arg(&dst)
-                    .arg(&dst_stride)
-                    .arg(&n);
-                let blocks = (n as u32).div_ceil(1024).min(64);
-                unsafe { b.launch(Self::config((blocks, kv_heads as u32, 1), 256, 0)) }.w()?;
-            }
-        }
-        let cp_in = slice_address(&self.cp_in, &st);
-        self.copy_rows(address(&hidden, &st)?, cp_in, t.hidden)?;
         let trailing = trailing_text_hidden.contiguous()?;
         self.copy_rows(
             address(&trailing, &st)?,
@@ -815,8 +897,6 @@ impl CudaFrames {
             )
         };
         st.memcpy_htod(bytes, &mut self.state).w()?;
-        // The caches were copied, enqueued before Candle's are freed.
-        talker.clear_cache();
 
         if self.mode == Mode::Graph && self.graph.is_none() {
             st.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)

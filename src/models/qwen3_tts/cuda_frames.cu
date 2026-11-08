@@ -492,13 +492,18 @@ extern "C" __global__ void copy_rows(const bf16 *__restrict__ src, bf16 *__restr
         dst[i] = src[i];
 }
 
-// Copies a prefill's cache (heads of len rows, src_stride apart) into a
-// cache of dst_stride per head.
-extern "C" __global__ void copy_cache(const bf16 *__restrict__ src, long long src_stride,
-                                      bf16 *__restrict__ dst, long long dst_stride, int n) {
-    const int h = blockIdx.y;
-    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
-        dst[h * dst_stride + i] = src[h * src_stride + i];
+// Candle's silu(gate) * up of [gate | up] rows (as the gated GEMV input),
+// for the prompt's rows.
+extern "C" __global__ void silu_mul(const bf16 *__restrict__ gate_up, bf16 *__restrict__ out,
+                                    int inter, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const int m = i / inter, k = i - m * inter;
+        const float g = f32(gate_up[(size_t)m * 2 * inter + k]);
+        const float u = f32(gate_up[(size_t)m * 2 * inter + inter + k]);
+        const float e = rnd(__expf(-g));
+        const float sig = rnd(1.f / rnd(1.f + e));
+        out[i] = to_bf16(rnd(g * sig) * u);
+    }
 }
 
 extern "C" __global__ void advance(State *state) {
