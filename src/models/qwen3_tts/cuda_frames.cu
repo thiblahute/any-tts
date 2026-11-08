@@ -74,8 +74,10 @@ extern "C" __global__ void rms_norm(const bf16 *__restrict__ x, const bf16 *__re
 }
 
 // y[m][n] = sum_k w[n][k] x[m][k] for m < M (1 or 2), K a multiple of 8.
-// x is staged in shared memory, where `gated` makes it Candle's
-// silu(gate) * up of a [gate | up] row of 2K. A warp makes an output row,
+// x is staged in shared memory, where `norm` makes it RMS-normalized with
+// those weights first (each block normalizes the row itself, which saves
+// a kernel), and `gated` makes it Candle's silu(gate) * up of a
+// [gate | up] row of 2K. A warp makes an output row,
 // its lanes streaming 16 bytes of the weights at a time (evict-first: they
 // are read once a frame, and the 4 MB of L2 could not keep them anyway),
 // with f32 accumulation. The output is rounded, then the bias or the
@@ -83,11 +85,23 @@ extern "C" __global__ void rms_norm(const bf16 *__restrict__ x, const bf16 *__re
 extern "C" __global__ void gemv(const bf16 *__restrict__ w, const bf16 *__restrict__ x, bf16 *y,
                                 int K, int N, int M, int x_stride, int y_stride,
                                 const bf16 *__restrict__ bias, const bf16 *resid,
-                                int resid_stride, int gated) {
+                                int resid_stride, int gated, const bf16 *__restrict__ norm,
+                                float eps) {
     extern __shared__ uint4 shared_x[];
     bf16 *xs = (bf16 *)shared_x;
     for (int m = 0; m < M; m++) {
         const bf16 *row = x + (size_t)m * x_stride;
+        if (norm) {
+            float s = 0.f;
+            for (int k = threadIdx.x; k < K; k += blockDim.x) {
+                const float v = f32(row[k]);
+                s += v * v;
+            }
+            const float scale = rsqrtf(block_sum(s) / K + eps);
+            for (int k = threadIdx.x; k < K; k += blockDim.x)
+                xs[m * K + k] = to_bf16(scale * f32(row[k]) * f32(norm[k]));
+            continue;
+        }
         for (int k = threadIdx.x; k < K; k += blockDim.x) {
             if (gated) {
                 const float g = f32(row[k]), u = f32(row[K + k]);

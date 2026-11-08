@@ -58,6 +58,15 @@ struct State {
     draws: u64,
 }
 
+/// What a GEMV multiplies: its input as is, RMS-normalized (weights,
+/// epsilon), or the SiLU-gated half of a [gate | up] row.
+#[derive(Clone, Copy)]
+enum Input {
+    Plain,
+    Normed(u64, f32),
+    Gated,
+}
+
 /// How the talker samples group 0, from its generation config.
 pub struct FrameSampling {
     pub max_tokens: usize,
@@ -116,7 +125,6 @@ struct Stack {
     k_cache: CudaSlice<u16>,
     v_cache: CudaSlice<u16>,
     x: CudaSlice<u16>,
-    h: CudaSlice<u16>,
     qkv: CudaSlice<u16>,
     q: CudaSlice<u16>,
     attn: CudaSlice<u16>,
@@ -271,7 +279,6 @@ impl Stack {
             k_cache: stream.alloc_zeros(cache).w()?,
             v_cache: stream.alloc_zeros(cache).w()?,
             x: stream.alloc_zeros(rows * hidden).w()?,
-            h: stream.alloc_zeros(rows * hidden).w()?,
             qkv: stream.alloc_zeros(rows * qkv_dim).w()?,
             q: stream.alloc_zeros(rows * heads * HEAD_DIM).w()?,
             attn: stream.alloc_zeros(rows * heads * HEAD_DIM).w()?,
@@ -428,7 +435,8 @@ impl CudaFrames {
         Ok(())
     }
 
-    /// y = w x (+ bias | + resid) for `m` rows; see the kernel.
+    /// y = w x (+ bias | + resid) for `m` rows, x first RMS-normalized
+    /// with `norm` (if not 0) or gated; see the kernel.
     #[allow(clippy::too_many_arguments)]
     fn gemv(
         &self,
@@ -440,23 +448,21 @@ impl CudaFrames {
         m: usize,
         bias: u64,
         resid: u64,
-        gated: bool,
+        input: Input,
     ) -> Result<()> {
         let (k32, n32, m32) = (k as i32, n as i32, m as i32);
-        let x_stride = if gated { 2 * k32 } else { k32 };
-        let gated = gated as i32;
+        let (gated, norm, eps) = match input {
+            Input::Plain => (0i32, 0u64, 0f32),
+            Input::Gated => (1, 0, 0.),
+            Input::Normed(norm, eps) => (0, norm, eps),
+        };
+        let x_stride = if gated == 1 { 2 * k32 } else { k32 };
         let blocks = (n as u32).div_ceil(GEMV_WARPS);
         let shared = (m * k * 2) as u32;
         let mut b = self.stream.launch_builder(&self.k.gemv);
-        b.arg(&w)
-            .arg(&x)
-            .arg(&y)
-            .arg(&k32)
-            .arg(&n32)
-            .arg(&m32)
-            .arg(&x_stride)
-            .arg(&n32);
-        b.arg(&bias).arg(&resid).arg(&n32).arg(&gated);
+        b.arg(&w).arg(&x).arg(&y).arg(&k32).arg(&n32).arg(&m32);
+        b.arg(&x_stride).arg(&n32).arg(&bias).arg(&resid).arg(&n32);
+        b.arg(&gated).arg(&norm).arg(&eps);
         unsafe { b.launch(Self::config((blocks, 1, 1), GEMV_WARPS * 32, shared)) }.w()?;
         Ok(())
     }
@@ -465,7 +471,7 @@ impl CudaFrames {
     /// first at position `*pos + base` (`pos` 0 for none).
     fn forward(&self, s: &Stack, rows: usize, pos: u64, base: i32) -> Result<()> {
         let st = &self.stream;
-        let (x, h) = (slice_address(&s.x, st), slice_address(&s.h, st));
+        let x = slice_address(&s.x, st);
         let (qkv, q, attn) = (
             slice_address(&s.qkv, st),
             slice_address(&s.q, st),
@@ -484,18 +490,9 @@ impl CudaFrames {
         for (i, layer) in s.layers.iter().enumerate() {
             let k_cache = s.cache_layer(&s.k_cache, i, st);
             let v_cache = s.cache_layer(&s.v_cache, i, st);
-            self.rms_norm(x, layer.input_norm, h, s.hidden, rows, s.eps)?;
-            self.gemv(
-                layer.qkv,
-                h,
-                qkv,
-                s.hidden,
-                qkv_dim,
-                rows,
-                layer.qkv_bias,
-                0,
-                false,
-            )?;
+            let normed = Input::Normed(layer.input_norm, s.eps);
+            let (w, bias) = (layer.qkv, layer.qkv_bias);
+            self.gemv(w, x, qkv, s.hidden, qkv_dim, rows, bias, 0, normed)?;
             let mut b = st.launch_builder(&self.k.qk_norm_rope);
             b.arg(&qkv)
                 .arg(&qkv_stride)
@@ -532,20 +529,12 @@ impl CudaFrames {
                 ))
             }
             .w()?;
-            self.gemv(layer.o, attn, x, q_dim, s.hidden, rows, 0, x, false)?;
-            self.rms_norm(x, layer.post_norm, h, s.hidden, rows, s.eps)?;
-            self.gemv(
-                layer.gate_up,
-                h,
-                gate_up,
-                s.hidden,
-                2 * s.inter,
-                rows,
-                0,
-                0,
-                false,
-            )?;
-            self.gemv(layer.down, gate_up, x, s.inter, s.hidden, rows, 0, x, true)?;
+            self.gemv(layer.o, attn, x, q_dim, s.hidden, rows, 0, x, Input::Plain)?;
+            let normed = Input::Normed(layer.post_norm, s.eps);
+            let (w, inter) = (layer.gate_up, 2 * s.inter);
+            self.gemv(w, x, gate_up, s.hidden, inter, rows, 0, 0, normed)?;
+            let (w, gated) = (layer.down, Input::Gated);
+            self.gemv(w, gate_up, x, s.inter, s.hidden, rows, 0, x, gated)?;
         }
         Ok(())
     }
@@ -616,17 +605,8 @@ impl CudaFrames {
         let state = slice_address(&self.state, st);
 
         // Group 0.
-        self.gemv(
-            self.codec_head,
-            cp_in,
-            logits,
-            hidden,
-            self.talker_vocab,
-            1,
-            0,
-            0,
-            false,
-        )?;
+        let (w, vocab) = (self.codec_head, self.talker_vocab);
+        self.gemv(w, cp_in, logits, hidden, vocab, 1, 0, 0, Input::Plain)?;
         self.sample(logits, self.talker_vocab, true, 0)?;
         self.embed(
             self.codec_embed,
@@ -638,30 +618,19 @@ impl CudaFrames {
 
         // Groups 1-15: the prefill on [hidden state, group 0], then a step a group.
         let cx = slice_address(&c.x, st);
-        let ch = slice_address(&c.h, st);
         for group in 1..FRAME_CODES {
             let (input, rows) = if group == 1 { (cp_in, 2) } else { (emb, 1) };
             match self.cp_proj {
                 Some((w, bias)) => {
-                    self.gemv(w, input, cx, hidden, c.hidden, rows, bias, 0, false)?
+                    self.gemv(w, input, cx, hidden, c.hidden, rows, bias, 0, Input::Plain)?
                 }
                 None => self.copy_rows(input, cx, rows * hidden)?,
             }
             let base = if group == 1 { 0 } else { group as i32 };
             self.forward(c, rows, 0, base)?;
             let last = cx + 2 * ((rows - 1) * c.hidden) as u64;
-            self.rms_norm(last, c.final_norm, ch, c.hidden, 1, c.eps)?;
-            self.gemv(
-                self.cp_heads[group - 1],
-                ch,
-                logits,
-                c.hidden,
-                self.cp_vocab,
-                1,
-                0,
-                0,
-                false,
-            )?;
+            let (w, normed) = (self.cp_heads[group - 1], Input::Normed(c.final_norm, c.eps));
+            self.gemv(w, last, logits, c.hidden, self.cp_vocab, 1, 0, 0, normed)?;
             self.sample(logits, self.cp_vocab, false, group as i32)?;
             self.embed(self.cp_embeds[group - 1], hidden, emb, summed, 2)?;
         }
