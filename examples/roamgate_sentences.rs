@@ -4,6 +4,8 @@
 //!   cargo run --release --features metal --example roamgate_sentences -- \
 //!     <model-dir> <sentences.tsv> <out-dir> [speaker | voice.json]
 //!
+//! It runs on the best device built in (CUDA, then Metal, then the CPU).
+//!
 //! A voice JSON (from scripts/qwen3_tts_voice.py) clones that voice with a
 //! Qwen3-TTS Base model instead of using a named speaker.
 
@@ -31,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     let model = load_model(
         TtsConfig::new(ModelType::Qwen3Tts)
             .with_model_path(model_dir)
-            .with_device(DeviceSelection::Metal(0)),
+            .with_device(DeviceSelection::Auto),
     )?;
     println!("load {:.0} ms, speakers {:?}", started.elapsed().as_secs_f64() * 1000.0, model.supported_voices());
 
@@ -56,7 +58,9 @@ fn main() -> anyhow::Result<()> {
         let mut first_audio_ms = None;
         let mut samples = Vec::new();
         let mut rate = 24_000;
+        let mut chunks = 0;
         model.synthesize_stream(&request, &mut |chunk| {
+            chunks += 1;
             if !chunk.samples.is_empty() {
                 first_audio_ms.get_or_insert(started.elapsed().as_secs_f64() * 1000.0);
                 rate = chunk.sample_rate;
@@ -69,13 +73,17 @@ fn main() -> anyhow::Result<()> {
         let audio = any_tts::AudioSamples::new(samples, rate);
         let path = format!("{out_dir}/{:02}-{lang}.wav", index + 1);
         audio.save_wav(&path)?;
+        // The codec makes a frame of 1920 samples, 80 ms at 24 kHz.
+        let frames = audio.samples.len() / 1920;
         println!(
-            "{:02} {lang} first audio {:.0} ms, total {:.0} ms, audio {:.1} s, RTF {:.2}: {}",
+            "{:02} {lang} first audio {:.0} ms, total {:.0} ms, audio {:.1} s, RTF {:.3}, \
+             {frames} frames, {:.1} ms/frame, {chunks} chunks: {}",
             index + 1,
             first_audio_ms.unwrap_or(0.0),
             total * 1000.0,
             seconds,
             if seconds > 0.0 { total / seconds } else { f64::NAN },
+            total * 1000.0 / frames.max(1) as f64,
             text
         );
     }
