@@ -92,6 +92,7 @@ struct Kernels {
     qk_norm_rope: CudaFunction,
     attn_partial: CudaFunction,
     attn_combine: CudaFunction,
+    causal_softmax: CudaFunction,
     sample: CudaFunction,
     embed: CudaFunction,
     talker_input: CudaFunction,
@@ -323,6 +324,7 @@ impl CudaFrames {
             qk_norm_rope: kernel(cuda, "qk_norm_rope")?,
             attn_partial: kernel(cuda, "attn_partial")?,
             attn_combine: kernel(cuda, "attn_combine")?,
+            causal_softmax: kernel(cuda, "causal_softmax")?,
             sample: kernel(cuda, "sample")?,
             embed: kernel(cuda, "embed")?,
             talker_input: kernel(cuda, "talker_input")?,
@@ -482,7 +484,8 @@ impl CudaFrames {
     /// Layer `layer`'s attention for `rows` tokens from their q/k/v
     /// projections: q and k normalized and rotated, k and v into the
     /// caches at `*pos + base` on, then attention over each token's causal
-    /// range in `splits` key splits (partials in `ml`, `acc`), to `out`.
+    /// range in `splits` key splits (partials in `ml`, `acc`), to `out`;
+    /// no attention with no splits.
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
@@ -513,6 +516,9 @@ impl CudaFrames {
         b.arg(&heads).arg(&kv_heads);
         let grid = ((s.heads + 2 * s.kv_heads) as u32, rows as u32, 1);
         unsafe { b.launch(Self::config(grid, (HEAD_DIM / 2) as u32, 0)) }.w()?;
+        if splits == 0 {
+            return Ok(());
+        }
         let mut b = st.launch_builder(&self.k.attn_partial);
         b.arg(&q).arg(&k_cache).arg(&v_cache).arg(&pos).arg(&base);
         b.arg(&cap)
@@ -575,6 +581,120 @@ impl CudaFrames {
         .map_err(|error| candle_core::Error::Msg(format!("cuBLAS: {error:?}")))
     }
 
+    /// The prompt's attention in talker layer `layer`, from its queries
+    /// `q` ([rows][heads][128]) and the caches, to `out` (same layout):
+    /// each head's scores and weighted values as batched GEMMs (tensor
+    /// cores, which a prompt of a few hundred positions keeps busy), and
+    /// the causal softmax between them, through `scores` (f32) and `probs`
+    /// (bf16), heads x rows x rows each.
+    fn prompt_attention(
+        &self,
+        layer: usize,
+        rows: usize,
+        q: u64,
+        out: u64,
+        (scores, probs): (u64, u64),
+    ) -> Result<()> {
+        use candle_core::cuda::cudarc::cublas::{result::gemm_strided_batched_ex, sys as blas};
+        let t = &self.talker;
+        let st = &self.stream;
+        let group = t.heads / t.kv_heads;
+        let (k_cache, v_cache) = (
+            t.cache_layer(&t.k_cache, layer, st),
+            t.cache_layer(&t.v_cache, layer, st),
+        );
+        let (n, d) = (rows as i32, HEAD_DIM as i32);
+        let row = (t.heads * HEAD_DIM) as i32;
+        let cache_stride = (t.cap * HEAD_DIM) as i64;
+        let square = (rows * rows) as i64;
+        let (scale, one, zero) = (1.0f32 / (HEAD_DIM as f32).sqrt(), 1f32, 0f32);
+        let (bf16, f32_) = (
+            blas::cudaDataType::CUDA_R_16BF,
+            blas::cudaDataType::CUDA_R_32F,
+        );
+        let (op_n, op_t) = (
+            blas::cublasOperation_t::CUBLAS_OP_N,
+            blas::cublasOperation_t::CUBLAS_OP_T,
+        );
+        let (compute, algo) = (
+            blas::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            blas::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        );
+        let error = |e| candle_core::Error::Msg(format!("cuBLAS: {e:?}"));
+        // Query heads g, g + group, ... share kv heads 0, 1, ...: one batch each.
+        let batch = t.kv_heads as i32;
+        for g in 0..group {
+            let q = q + 2 * (g * HEAD_DIM) as u64;
+            let s = scores + 4 * (g as u64) * square as u64;
+            // Column-major S^T (keys x queries) = K (keys x 128) Q^T.
+            unsafe {
+                gemm_strided_batched_ex(
+                    *self.blas.handle(),
+                    op_t,
+                    op_n,
+                    n,
+                    n,
+                    d,
+                    &scale as *const f32 as *const _,
+                    k_cache as *const _,
+                    bf16,
+                    d,
+                    cache_stride,
+                    q as *const _,
+                    bf16,
+                    row,
+                    (group * HEAD_DIM) as i64,
+                    &zero as *const f32 as *const _,
+                    s as *mut _,
+                    f32_,
+                    n,
+                    group as i64 * square,
+                    batch,
+                    compute,
+                    algo,
+                )
+            }
+            .map_err(error)?;
+        }
+        let mut b = st.launch_builder(&self.k.causal_softmax);
+        b.arg(&scores).arg(&probs).arg(&n);
+        unsafe { b.launch(Self::config((rows as u32, t.heads as u32, 1), 128, 0)) }.w()?;
+        for g in 0..group {
+            let p = probs + 2 * (g as u64) * square as u64;
+            let o = out + 2 * (g * HEAD_DIM) as u64;
+            // Column-major O^T (128 x queries) = V^T (128 x keys) P^T.
+            unsafe {
+                gemm_strided_batched_ex(
+                    *self.blas.handle(),
+                    op_n,
+                    op_n,
+                    d,
+                    n,
+                    n,
+                    &one as *const f32 as *const _,
+                    v_cache as *const _,
+                    bf16,
+                    d,
+                    cache_stride,
+                    p as *const _,
+                    bf16,
+                    n,
+                    group as i64 * square,
+                    &zero as *const f32 as *const _,
+                    o as *mut _,
+                    bf16,
+                    row,
+                    (group * HEAD_DIM) as i64,
+                    batch,
+                    compute,
+                    algo,
+                )
+            }
+            .map_err(error)?;
+        }
+        Ok(())
+    }
+
     /// Runs a prompt (`rows` embeddings at `embeds`) through the talker
     /// from position 0, filling its caches, and leaves the last position's
     /// normed hidden state where a frame starts. The projections go
@@ -596,16 +716,17 @@ impl CudaFrames {
         let attn = st.alloc_zeros::<u16>(rows * q_dim).w()?;
         let gate_up = st.alloc_zeros::<u16>(rows * 2 * inter).w()?;
         let act = st.alloc_zeros::<u16>(rows * inter).w()?;
-        let ml = st.alloc_zeros::<f32>(rows * t.heads * 2).w()?;
-        let acc = st.alloc_zeros::<f32>(rows * q_dim).w()?;
+        let scores = st.alloc_zeros::<f32>(t.heads * rows * rows).w()?;
+        let probs = st.alloc_zeros::<u16>(t.heads * rows * rows).w()?;
         let [x, h, qkv, q, attn, gate_up, act] =
             [&x, &h, &qkv, &q, &attn, &gate_up, &act].map(|b| slice_address(b, st));
-        let (ml, acc) = (slice_address(&ml, st), slice_address(&acc, st));
+        let (scores, probs) = (slice_address(&scores, st), slice_address(&probs, st));
         self.copy_rows(embeds, x, rows * hidden)?;
         for (i, layer) in t.layers.iter().enumerate() {
             self.rms_norm(x, layer.input_norm, h, hidden, rows, t.eps)?;
             self.gemm(layer.qkv, h, qkv, rows, hidden, qkv_dim, false)?;
-            self.attention(t, i, rows, (0, 0), qkv, q, attn, (ml, acc, 1))?;
+            self.attention(t, i, rows, (0, 0), qkv, q, 0, (0, 0, 0))?;
+            self.prompt_attention(i, rows, q, attn, (scores, probs))?;
             self.gemm(layer.o, attn, x, rows, q_dim, hidden, true)?;
             self.rms_norm(x, layer.post_norm, h, hidden, rows, t.eps)?;
             self.gemm(layer.gate_up, h, gate_up, rows, hidden, 2 * inter, false)?;

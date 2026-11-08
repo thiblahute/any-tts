@@ -304,6 +304,29 @@ extern "C" __global__ void attn_combine(const float *__restrict__ part_ml,
     out[((size_t)m * heads + h) * HEAD_DIM + d] = to_bf16(A / L);
 }
 
+// A prompt's causal softmax: row m of each head's scores (f32, n x n,
+// already scaled) over keys 0..m, written as bf16 probabilities with zeros
+// past m. One block per (row, head).
+extern "C" __global__ void causal_softmax(const float *__restrict__ scores, bf16 *__restrict__ probs,
+                                          int n) {
+    const int m = blockIdx.x;
+    const size_t at = ((size_t)blockIdx.y * n + m) * n;
+    float mx = -INFINITY;
+    for (int j = threadIdx.x; j <= m; j += blockDim.x) mx = fmaxf(mx, scores[at + j]);
+    __shared__ float shared[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if (lane == 0) shared[warp] = mx;
+    __syncthreads();
+    mx = -INFINITY;
+    for (int w = 0; w < (int)(blockDim.x >> 5); w++) mx = fmaxf(mx, shared[w]);
+    float sum = 0.f;
+    for (int j = threadIdx.x; j <= m; j += blockDim.x) sum += __expf(scores[at + j] - mx);
+    sum = block_sum(sum);
+    for (int j = threadIdx.x; j < n; j += blockDim.x)
+        probs[at + j] = to_bf16(j <= m ? __expf(scores[at + j] - mx) / sum : 0.f);
+}
+
 #define SAMPLE_THREADS 1024
 #define SAMPLE_PER_THREAD 4
 #define FRAME_SLOTS 4
