@@ -44,6 +44,9 @@ const GEMV_WARPS: u32 = 8;
 const PREFETCH_BYTES: i32 = 1 << 20;
 const SAMPLE_THREADS: u32 = 1024;
 const MAX_VOCAB: usize = 4096;
+/// The longest prompt whose attention runs as batched GEMMs, over
+/// rows x rows scores a head (256 MB of them at 2048 positions).
+const MAX_BATCHED_PROMPT: usize = 2048;
 
 /// Mirror of the kernels' `State`.
 #[repr(C)]
@@ -739,17 +742,29 @@ impl CudaFrames {
         let attn = st.alloc_zeros::<u16>(rows * q_dim).w()?;
         let gate_up = st.alloc_zeros::<u16>(rows * 2 * inter).w()?;
         let act = st.alloc_zeros::<u16>(rows * inter).w()?;
-        let scores = st.alloc_zeros::<f32>(t.heads * rows * rows).w()?;
-        let probs = st.alloc_zeros::<u16>(t.heads * rows * rows).w()?;
+        // Scores and probabilities, rows x rows a head: past a few thousand
+        // positions, the split attention instead, with its partials.
+        let batched = rows <= MAX_BATCHED_PROMPT;
+        let square = if batched { rows * rows } else { 0 };
+        let scores = st.alloc_zeros::<f32>((t.heads * square).max(1)).w()?;
+        let probs = st.alloc_zeros::<u16>((t.heads * square).max(1)).w()?;
+        let parts = if batched { 1 } else { rows * t.heads };
+        let ml = st.alloc_zeros::<f32>(2 * parts).w()?;
+        let acc = st.alloc_zeros::<f32>(HEAD_DIM * parts).w()?;
         let [x, h, qkv, q, attn, gate_up, act] =
             [&x, &h, &qkv, &q, &attn, &gate_up, &act].map(|b| slice_address(b, st));
         let (scores, probs) = (slice_address(&scores, st), slice_address(&probs, st));
+        let (ml, acc) = (slice_address(&ml, st), slice_address(&acc, st));
         self.copy_rows(embeds, x, rows * hidden)?;
         for (i, layer) in t.layers.iter().enumerate() {
             self.rms_norm(x, layer.input_norm, h, hidden, rows, t.eps)?;
             self.gemm(layer.qkv, h, qkv, rows, hidden, qkv_dim, false)?;
-            self.attention(t, i, rows, (0, 0), qkv, q, 0, (0, 0, 0))?;
-            self.prompt_attention(i, rows, q, attn, (scores, probs))?;
+            if batched {
+                self.attention(t, i, rows, (0, 0), qkv, q, 0, (0, 0, 0))?;
+                self.prompt_attention(i, rows, q, attn, (scores, probs))?;
+            } else {
+                self.attention(t, i, rows, (0, 0), qkv, q, attn, (ml, acc, 1))?;
+            }
             self.gemm(layer.o, attn, x, rows, q_dim, hidden, true)?;
             self.rms_norm(x, layer.post_norm, h, hidden, rows, t.eps)?;
             self.gemm(layer.gate_up, h, gate_up, rows, hidden, 2 * inter, false)?;
