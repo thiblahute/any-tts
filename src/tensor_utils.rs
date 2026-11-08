@@ -201,6 +201,10 @@ pub fn cpu_flash_attention(
 ///
 /// Used in the Qwen3-TTS speech tokenizer decoder (SNAC-style vocoder).
 pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
+    #[cfg(feature = "cuda")]
+    if let Some(y) = crate::layers::cuda_ops::snake_beta(x, alpha, beta)? {
+        return Ok(y);
+    }
     let alpha = alpha.exp()?;
     let beta = beta.exp()?;
     let ax = x.broadcast_mul(&alpha)?;

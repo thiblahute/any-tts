@@ -5,10 +5,13 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-const KERNELS: &[(&str, &str)] = &[(
-    "src/models/qwen3_tts/cuda_frames.cu",
-    "qwen3_tts_frames.ptx",
-)];
+const KERNELS: &[(&str, &str)] = &[
+    (
+        "src/models/qwen3_tts/cuda_frames.cu",
+        "qwen3_tts_frames.ptx",
+    ),
+    ("src/layers/cuda_ops.cu", "cuda_ops.ptx"),
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

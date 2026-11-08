@@ -17,5 +17,7 @@ pub use conv::{AdaIn1d, AdaLayerNorm, Conv1d, ConvTranspose1d, InstanceNorm1d, L
 pub use lstm::Lstm;
 pub use mlp::SiluMlp;
 pub use transformer::TransformerBlock;
+#[cfg(feature = "cuda")]
+pub mod cuda_ops;
 pub mod metal_conv;
 pub mod metal_ops;
