@@ -32,7 +32,7 @@ use candle_nn::{
 
 use crate::layers::metal_conv::{depthwise_conv1d, MetalConv, Snake};
 use crate::tensor_utils::{
-    apply_rotary_emb, cpu_flash_attention, precompute_rope_freqs, snake_beta,
+    apply_rotary_emb, cpu_flash_attention, precompute_rope_freqs, SnakeBeta,
 };
 
 /// Causal (left-only) padding for 1-D convolutions.
@@ -702,11 +702,9 @@ impl UpsampleStage {
 
 /// A residual block with dual SnakeBeta activations.
 struct SnacResBlock {
-    act1_alpha: Tensor,
-    act1_beta: Tensor,
+    act1: SnakeBeta,
     conv1: Conv1d,
-    act2_alpha: Tensor,
-    act2_beta: Tensor,
+    act2: SnakeBeta,
     conv2: Conv1d,
     /// Left-pad amount for conv1 (causal): (kernel-1) * dilation.
     conv1_left_pad: usize,
@@ -750,11 +748,9 @@ impl SnacResBlock {
             _ => None,
         };
         Ok(Self {
-            act1_alpha,
-            act1_beta,
+            act1: SnakeBeta::new(&act1_alpha, &act1_beta)?,
             conv1,
-            act2_alpha,
-            act2_beta,
+            act2: SnakeBeta::new(&act2_alpha, &act2_beta)?,
             conv2,
             conv1_left_pad,
             metal,
@@ -770,14 +766,10 @@ impl SnacResBlock {
                 return conv2.forward(&h, Some(act2), Some(x));
             }
         }
-        let alpha1 = self.act1_alpha.unsqueeze(0)?.unsqueeze(2)?;
-        let beta1 = self.act1_beta.unsqueeze(0)?.unsqueeze(2)?;
-        let h = snake_beta(x, &alpha1, &beta1)?;
+        let h = self.act1.forward(x)?;
         // Causal left-pad for dilated conv1
         let h = self.conv1.forward(&stream_pad(&h, self.conv1_left_pad, stream)?)?;
-        let alpha2 = self.act2_alpha.unsqueeze(0)?.unsqueeze(2)?;
-        let beta2 = self.act2_beta.unsqueeze(0)?.unsqueeze(2)?;
-        let h = snake_beta(&h, &alpha2, &beta2)?;
+        let h = self.act2.forward(&h)?;
         let h = self.conv2.forward(&h)?;
         x + &h
     }
@@ -785,8 +777,7 @@ impl SnacResBlock {
 
 /// A decoder stage: SnakeBeta → ConvTranspose1d → 3× ResBlock.
 struct DecoderStage {
-    snake_alpha_param: Tensor,
-    snake_beta_param: Tensor,
+    snake: SnakeBeta,
     upsample_conv: ConvTranspose1d,
     /// On Metal: SnakeBeta and the transposed convolution in one kernel.
     metal_conv: Option<(MetalConv, Snake)>,
@@ -840,8 +831,7 @@ impl DecoderStage {
             None => None,
         };
         Ok(Self {
-            snake_alpha_param,
-            snake_beta_param,
+            snake: SnakeBeta::new(&snake_alpha_param, &snake_beta_param)?,
             upsample_conv,
             metal_conv,
             res_blocks,
@@ -858,9 +848,7 @@ impl DecoderStage {
             let h = stream_pad(x, kernel_size / stride - 1, stream.as_deref_mut())?;
             conv.forward(&h, Some(snake), None)?
         } else {
-            let alpha = self.snake_alpha_param.unsqueeze(0)?.unsqueeze(2)?;
-            let beta = self.snake_beta_param.unsqueeze(0)?.unsqueeze(2)?;
-            let h = snake_beta(x, &alpha, &beta)?;
+            let h = self.snake.forward(x)?;
             let h = self.upsample_conv.forward(&h)?;
             // Trim right side for causal ConvTranspose1d
             let right_pad = kernel_size - stride;
@@ -901,10 +889,8 @@ pub struct SpeechTokenizerDecoder {
     metal_init_conv: Option<MetalConv>,
     /// Decoder stages (SnakeBeta + ConvTranspose + ResBlocks).
     decoder_stages: Vec<DecoderStage>,
-    /// Final SnakeBeta alpha parameter.
-    final_snake_alpha: Tensor,
-    /// Final SnakeBeta beta parameter.
-    final_snake_beta: Tensor,
+    /// Final SnakeBeta.
+    final_snake: SnakeBeta,
     /// Final convolution → 1 channel.
     final_conv: Conv1d,
     /// On Metal: the final SnakeBeta and convolution in one kernel.
@@ -1020,8 +1006,7 @@ impl SpeechTokenizerDecoder {
             metal_init_conv: MetalConv::conv1d(&decoder_init_conv)?,
             decoder_init_conv,
             decoder_stages,
-            final_snake_alpha,
-            final_snake_beta,
+            final_snake: SnakeBeta::new(&final_snake_alpha, &final_snake_beta)?,
             final_conv,
             metal_final_conv,
             config: config.clone(),
@@ -1095,9 +1080,7 @@ impl SpeechTokenizerDecoder {
                 conv.forward(&stream_pad(&h, 6, stream.as_deref_mut())?, Some(snake), None)?
             }
             None => {
-                let alpha = self.final_snake_alpha.unsqueeze(0)?.unsqueeze(2)?;
-                let beta = self.final_snake_beta.unsqueeze(0)?.unsqueeze(2)?;
-                let h = snake_beta(&h, &alpha, &beta)?;
+                let h = self.final_snake.forward(&h)?;
                 self.final_conv
                     .forward(&stream_pad(&h, 6, stream.as_deref_mut())?)?
             }

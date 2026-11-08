@@ -194,6 +194,36 @@ pub fn cpu_flash_attention(
     Ok(Some(attn))
 }
 
+/// SnakeBeta's per-channel parameters (log-space, as stored), prepared
+/// once: on CUDA, for one kernel a call (see [`snake_beta`]).
+pub struct SnakeBeta {
+    alpha: Tensor,
+    beta: Tensor,
+    #[cfg(feature = "cuda")]
+    cuda: Option<crate::layers::cuda_ops::Snake>,
+}
+
+impl SnakeBeta {
+    /// From `alpha` and `beta`, one value per channel each.
+    pub fn new(alpha: &Tensor, beta: &Tensor) -> Result<Self> {
+        Ok(Self {
+            #[cfg(feature = "cuda")]
+            cuda: crate::layers::cuda_ops::Snake::new(alpha, beta)?,
+            alpha: alpha.unsqueeze(0)?.unsqueeze(2)?,
+            beta: beta.unsqueeze(0)?.unsqueeze(2)?,
+        })
+    }
+
+    /// SnakeBeta of `x`, (batch, channels, len).
+    pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "cuda")]
+        if let Some(y) = self.cuda.as_ref().map(|snake| snake.forward(x)).transpose()?.flatten() {
+            return Ok(y);
+        }
+        snake_beta(x, &self.alpha, &self.beta)
+    }
+}
+
 /// SnakeBeta activation: x + (1/(exp(beta) + eps)) * sin²(exp(alpha) * x)
 ///
 /// `alpha` and `beta` are the learned parameters stored in **log-space**.
@@ -201,10 +231,6 @@ pub fn cpu_flash_attention(
 ///
 /// Used in the Qwen3-TTS speech tokenizer decoder (SNAC-style vocoder).
 pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Tensor> {
-    #[cfg(feature = "cuda")]
-    if let Some(y) = crate::layers::cuda_ops::snake_beta(x, alpha, beta)? {
-        return Ok(y);
-    }
     let alpha = alpha.exp()?;
     let beta = beta.exp()?;
     let ax = x.broadcast_mul(&alpha)?;

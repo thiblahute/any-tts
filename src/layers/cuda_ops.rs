@@ -10,29 +10,42 @@ const PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cuda_ops.ptx"));
 const MODULE: &str = "any_tts_cuda_ops";
 
 /// SnakeBeta, `x + sin(exp(alpha) x)^2 / (exp(beta) + 1e-9)` per channel,
-/// in one kernel instead of Candle's six passes over `x`, for a bf16
-/// (batch, channels, len) tensor on CUDA; `None` otherwise. `alpha` and
-/// `beta` hold one log-space value per channel.
-pub fn snake_beta(x: &Tensor, alpha: &Tensor, beta: &Tensor) -> Result<Option<Tensor>> {
-    if !matches!(x.device(), Device::Cuda(_)) || x.dtype() != DType::BF16 || x.rank() != 3 {
-        return Ok(None);
-    }
-    let (_, channels, len) = x.dims3()?;
-    if alpha.elem_count() != channels || beta.elem_count() != channels {
-        return Ok(None);
-    }
-    let alpha = alpha.flatten_all()?.to_dtype(DType::F32)?.exp()?;
-    let inv_beta = (beta.flatten_all()?.to_dtype(DType::F32)?.exp()? + 1e-9)?.recip()?;
-    let op = Snake {
-        alpha,
-        inv_beta,
-        channels,
-        len,
-    };
-    x.contiguous()?.apply_op1_no_bwd(&op).map(Some)
+/// in one kernel instead of Candle's six passes over `x`, its parameters'
+/// exponentials taken once.
+pub struct Snake {
+    alpha: Tensor,
+    inv_beta: Tensor,
 }
 
-struct Snake {
+impl Snake {
+    /// From the log-space `alpha` and `beta`, one value per channel each,
+    /// if they are on CUDA.
+    pub fn new(alpha: &Tensor, beta: &Tensor) -> Result<Option<Self>> {
+        if !matches!(alpha.device(), Device::Cuda(_)) {
+            return Ok(None);
+        }
+        let alpha = alpha.flatten_all()?.to_dtype(DType::F32)?.exp()?;
+        let inv_beta = (beta.flatten_all()?.to_dtype(DType::F32)?.exp()? + 1e-9)?.recip()?;
+        Ok(Some(Self { alpha, inv_beta }))
+    }
+
+    /// SnakeBeta of a bf16 (batch, channels, len) `x`; `None` for others.
+    pub fn forward(&self, x: &Tensor) -> Result<Option<Tensor>> {
+        if x.dtype() != DType::BF16 || x.rank() != 3 || x.dim(1)? != self.alpha.elem_count() {
+            return Ok(None);
+        }
+        let (_, channels, len) = x.dims3()?;
+        let op = SnakeOp {
+            alpha: self.alpha.clone(),
+            inv_beta: self.inv_beta.clone(),
+            channels,
+            len,
+        };
+        x.contiguous()?.apply_op1_no_bwd(&op).map(Some)
+    }
+}
+
+struct SnakeOp {
     alpha: Tensor,
     inv_beta: Tensor,
     channels: usize,
@@ -50,7 +63,7 @@ fn f32_address(t: &Tensor, stream: &candle_core::cuda::cudarc::driver::CudaStrea
     }
 }
 
-impl CustomOp1 for Snake {
+impl CustomOp1 for SnakeOp {
     fn name(&self) -> &'static str {
         "snake-beta"
     }
