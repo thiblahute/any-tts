@@ -88,6 +88,9 @@ pub struct Qwen3TtsModel {
     /// Frames on CUDA as graphs, instead of the talker's loop.
     #[cfg(feature = "cuda")]
     cuda_frames: Option<Mutex<super::cuda_frames::CudaFrames>>,
+    /// Milliseconds per frame of the last stream, decoding included, which
+    /// sizes the next stream's first chunk.
+    frame_pace: Mutex<Option<f64>>,
     /// The last cloned voices used, prepared, the most recent last.
     voices: Mutex<Vec<Arc<PreparedVoice>>>,
 }
@@ -220,6 +223,7 @@ impl TtsModel for Qwen3TtsModel {
             speech_tokenizer,
             #[cfg(feature = "cuda")]
             cuda_frames,
+            frame_pace: Mutex::new(None),
             voices: Mutex::new(Vec::new()),
         })
     }
@@ -258,10 +262,12 @@ impl TtsModel for Qwen3TtsModel {
         request: &SynthesisRequest,
         on_chunk: &mut dyn FnMut(AudioSamples) -> Result<(), TtsError>,
     ) -> Result<(), TtsError> {
-        // The first chunk is short so that audio starts early (see
-        // `first_chunk_due`); later ones grow, each decode having a fixed
-        // cost, once playback is covered.
-        const CHUNKS: [usize; 3] = [4, 8, 25];
+        // The first chunk is as short as the pace allows, so that audio
+        // starts early (see `first_chunk`); then each chunk doubles, up to
+        // MAX_CHUNK frames, each decode having a fixed cost. A chunk of n
+        // frames plays for n x 80 ms, time enough to make the next one, of
+        // 2n, while frames take well under 40 ms.
+        const MAX_CHUNK: usize = 25;
 
         self.validate_request(request)?;
         let speech_tokenizer = self.speech_tokenizer.as_ref().ok_or_else(|| {
@@ -289,14 +295,18 @@ impl TtsModel for Qwen3TtsModel {
                 .map_err(TtsError::ComputeError)?;
             on_chunk(AudioSamples::new(audio, 24000))
         };
-        let mut first_frame = None;
+        let pace = *self.frame_pace.lock().unwrap();
+        let mut next_chunk = 0;
+        let mut frames = (0usize, None, None);
         let mut on_frame = |g0: u32, groups: &[u32]| -> candle_core::Result<()> {
             pending.push((g0, groups.to_vec()));
+            let now = std::time::Instant::now();
+            let first = *frames.1.get_or_insert(now);
+            frames = (frames.0 + 1, Some(first), Some(now));
             let due = if chunks == 0 {
-                let since = *first_frame.get_or_insert_with(std::time::Instant::now);
-                first_chunk_due(pending.len(), CHUNKS[0], since.elapsed())
+                first_chunk(pending.len(), pace, first.elapsed())
             } else {
-                pending.len() >= CHUNKS[chunks.min(CHUNKS.len() - 1)]
+                pending.len() >= next_chunk
             };
             if due {
                 if let Err(error) = decode(&pending, &mut stream) {
@@ -305,6 +315,7 @@ impl TtsModel for Qwen3TtsModel {
                     return Err(candle_core::Error::Msg(message));
                 }
                 chunks += 1;
+                next_chunk = (2 * pending.len()).min(MAX_CHUNK);
                 pending.clear();
             }
             Ok(())
@@ -320,6 +331,10 @@ impl TtsModel for Qwen3TtsModel {
             return Err(error);
         }
         generated?;
+        if let (count @ 2.., Some(first), Some(last)) = frames {
+            let pace = (last - first).as_secs_f64() * 1000.0 / (count - 1) as f64;
+            *self.frame_pace.lock().unwrap() = Some(pace);
+        }
         if !pending.is_empty() {
             decode(&pending, &mut stream)?;
         }
@@ -1134,12 +1149,19 @@ impl Qwen3TtsModel {
 
 /// Identifies a voice embedding, to reuse its prepared form.
 /// Whether the first `frames` of a stream make its first chunk, the first
-/// frame having come `since_first` ago. Fewer than `chunk` when they come
-/// fast enough that the next chunk, of 8, is decoded before they have
-/// played (80 ms each): 2 frames when each takes 15 ms or less, 3 under 20.
-fn first_chunk_due(frames: usize, chunk: usize, since_first: std::time::Duration) -> bool {
+/// frame having come `since_first` ago, `pace` being the milliseconds per
+/// frame of the previous stream, decoding included. With a pace of 20 ms
+/// or less, one frame; under 30, two. Without one, the stream's own first
+/// frames give it: 2 frames when they take 15 ms or less each, 3 under 20,
+/// else 4.
+fn first_chunk(frames: usize, pace: Option<f64>, since_first: std::time::Duration) -> bool {
+    match pace {
+        Some(pace) if pace <= 20.0 => return true,
+        Some(pace) if pace <= 30.0 => return frames >= 2,
+        _ => {}
+    }
     let pace = since_first.as_secs_f64() * 1000.0 / frames.saturating_sub(1).max(1) as f64;
-    frames >= chunk || (frames == 2 && pace <= 15.0) || (frames == 3 && pace <= 20.0)
+    frames >= 4 || (frames == 2 && pace <= 15.0) || (frames == 3 && pace <= 20.0)
 }
 
 fn voice_key(embedding: &VoiceEmbedding) -> u64 {
