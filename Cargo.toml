@@ -12,6 +12,7 @@ repository = "https://github.com/TM9657/any-tts"
 keywords = ["tts", "text-to-speech", "candle", "ml", "audio"]
 categories = ["multimedia::audio", "science"]
 include = [
+	"/build.rs",
 	"/README.md",
 	"/CODE_OF_CONDUCT.md",
 	"/CONTRIBUTING.md",

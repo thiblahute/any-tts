@@ -23,6 +23,14 @@ impl RmsNorm {
         Ok(Self::new(weight, eps))
     }
 
+    pub fn weight(&self) -> &Tensor {
+        &self.weight
+    }
+
+    pub fn eps(&self) -> f64 {
+        self.eps
+    }
+
     /// Apply RMS normalization.
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         // Candle's fused kernel on the GPU, one call instead of seven.

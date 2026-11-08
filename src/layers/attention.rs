@@ -268,6 +268,21 @@ impl GroupedQueryAttention {
         self.kv_cache.clear();
     }
 
+    /// The stacked q/k/v projection, the output one and the q/k norms.
+    pub fn projections(&self) -> (&Linear, &Linear, Option<&RmsNorm>, Option<&RmsNorm>) {
+        (
+            &self.qkv_proj,
+            &self.o_proj,
+            self.q_norm.as_ref(),
+            self.k_norm.as_ref(),
+        )
+    }
+
+    /// Query heads, key/value heads and their size.
+    pub fn heads(&self) -> (usize, usize, usize) {
+        (self.num_heads, self.num_kv_heads, self.head_dim)
+    }
+
     /// Snapshot the current KV-cache so another caller can restore it later.
     pub fn cache_state(&self) -> Option<(Tensor, Tensor)> {
         self.kv_cache.tensors().ok().flatten()

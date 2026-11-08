@@ -53,6 +53,18 @@ impl<'a> TalkerGenerationConfig<'a> {
         self
     }
 
+    /// The sampling settings, for frames generated outside this loop.
+    #[cfg(feature = "cuda")]
+    pub fn frame_sampling(&self) -> super::cuda_frames::FrameSampling {
+        super::cuda_frames::FrameSampling {
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            top_k: self.top_k,
+            repetition_penalty: self.repetition_penalty,
+            repetition_window: self.repetition_window,
+        }
+    }
+
     pub fn with_predict_and_sum_fn(
         mut self,
         predict_and_sum_fn: &'a mut TalkerPredictAndSumFn<'a>,
@@ -423,6 +435,52 @@ impl TalkerLm {
 
         self.clear_cache();
         Ok((generated, all_group_tokens))
+    }
+
+    /// Run a prompt through the layers, filling their caches, and return
+    /// the last position's normed hidden state, (1, hidden).
+    #[cfg(feature = "cuda")]
+    pub fn prefill(&mut self, text_embeds: &Tensor) -> Result<Tensor> {
+        self.clear_cache();
+        let h = self.forward_prenorm(text_embeds, 0)?;
+        let h = self.apply_norm(&h)?;
+        h.i((.., h.dim(1)? - 1, ..))
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn caches(&self) -> impl Iterator<Item = Option<(Tensor, Tensor)>> + '_ {
+        self.layers.iter().map(TransformerBlock::cache_state)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn blocks(&self) -> impl Iterator<Item = &TransformerBlock> {
+        self.layers.iter()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn norm_weight(&self) -> &Tensor {
+        self.norm.weight()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn rope(&self) -> (&Tensor, &Tensor) {
+        (&self.rope_cos, &self.rope_sin)
+    }
+
+    /// Positions the RoPE tables cover.
+    #[cfg(feature = "cuda")]
+    pub fn positions(&self) -> usize {
+        self.rope_cos.dim(0).unwrap_or(0)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn codec_head_weight(&self) -> &Tensor {
+        self.codec_head.weight()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn codec_embedding(&self) -> &Tensor {
+        self.codec_embed.embeddings()
     }
 
     /// Clear all KV-caches (between independent sequences).

@@ -85,6 +85,9 @@ pub struct Qwen3TtsModel {
     /// Wrapped in Mutex for interior mutability (KV-cache updates during prediction).
     code_predictor: Option<Mutex<CodePredictor>>,
     speech_tokenizer: Option<SpeechTokenizerDecoder>,
+    /// Frames on CUDA as graphs, instead of the talker's loop.
+    #[cfg(feature = "cuda")]
+    cuda_frames: Option<Mutex<super::cuda_frames::CudaFrames>>,
     /// The last cloned voices used, prepared, the most recent last.
     voices: Mutex<Vec<Arc<PreparedVoice>>>,
 }
@@ -187,6 +190,25 @@ impl TtsModel for Qwen3TtsModel {
             None
         };
 
+        #[cfg(feature = "cuda")]
+        let cuda_frames = match &code_predictor {
+            Some(cp) => {
+                match super::cuda_frames::CudaFrames::new(
+                    &talker,
+                    cp,
+                    &model_config.talker_config,
+                    &device,
+                ) {
+                    Ok(frames) => frames.map(Mutex::new),
+                    Err(error) => {
+                        info!("Qwen3-TTS frames through Candle: {error}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
         Ok(Self {
             config: model_config,
             device,
@@ -196,6 +218,8 @@ impl TtsModel for Qwen3TtsModel {
             talker: Mutex::new(talker),
             code_predictor: code_predictor.map(Mutex::new),
             speech_tokenizer,
+            #[cfg(feature = "cuda")]
+            cuda_frames,
             voices: Mutex::new(Vec::new()),
         })
     }
@@ -911,7 +935,7 @@ impl Qwen3TtsModel {
         trailing_text_hidden: &Tensor,
         request: &SynthesisRequest,
         in_context: bool,
-        mut on_frame: Option<&mut dyn FnMut(u32, &[u32]) -> candle_core::Result<()>>,
+        on_frame: Option<&mut dyn FnMut(u32, &[u32]) -> candle_core::Result<()>>,
     ) -> Result<(Vec<u32>, Vec<Vec<u32>>), TtsError> {
         let max_tokens = request.max_tokens.unwrap_or(2048);
         // Default to 0.9 temperature with top-k 50 (matching reference)
@@ -930,6 +954,33 @@ impl Qwen3TtsModel {
         // The callback is called at each generation step with:
         //   (past_hidden, g0_token, g0_embed, device) -> (summed_embed, group_tokens)
         let has_cp = self.code_predictor.is_some();
+
+        #[cfg(feature = "cuda")]
+        let on_frame = match &self.cuda_frames {
+            Some(frames) => {
+                let sampling = generation_config().frame_sampling();
+                let mut talker = self.talker.lock().unwrap();
+                let (codec_tokens_g0, group_tokens) = frames
+                    .lock()
+                    .unwrap()
+                    .generate(
+                        &mut talker,
+                        full_input,
+                        trailing_text_hidden,
+                        sampling,
+                        on_frame,
+                    )
+                    .map_err(TtsError::ComputeError)?;
+                if codec_tokens_g0.is_empty() {
+                    return Err(TtsError::ModelError(
+                        "Qwen3-TTS: Talker generated no codec tokens".to_string(),
+                    ));
+                }
+                return Ok((codec_tokens_g0, group_tokens));
+            }
+            None => on_frame,
+        };
+        let mut on_frame = on_frame;
 
         let (codec_tokens_g0, group_tokens) = if has_cp {
             let cp_mutex = self.code_predictor.as_ref().unwrap();

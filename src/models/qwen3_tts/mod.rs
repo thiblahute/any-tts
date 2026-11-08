@@ -5,6 +5,8 @@
 
 pub mod code_predictor;
 pub mod config;
+#[cfg(feature = "cuda")]
+mod cuda_frames;
 pub mod model;
 mod sampling;
 pub mod speech_tokenizer;

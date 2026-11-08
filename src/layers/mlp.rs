@@ -43,6 +43,11 @@ impl SiluMlp {
     }
 
     /// Forward pass: `down_proj( silu(gate_proj(x)) * up_proj(x) )`
+    /// The stacked gate/up projection, the down one and the intermediate size.
+    pub fn projections(&self) -> (&Linear, &Linear, usize) {
+        (&self.gate_up_proj, &self.down_proj, self.intermediate_size)
+    }
+
     pub fn forward(&self, x: &Tensor) -> Result<Tensor> {
         let gate_up = self.gate_up_proj.forward(x)?;
         let last = gate_up.rank() - 1;

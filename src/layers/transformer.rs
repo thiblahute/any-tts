@@ -14,6 +14,25 @@ use crate::layers::mlp::SiluMlp;
 use crate::tensor_utils::RmsNorm;
 
 /// A single transformer decoder block.
+/// A block's weights, for kernels that run it outside Candle.
+pub struct BlockWeights {
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub eps: f64,
+    pub input_norm: Tensor,
+    pub qkv: Tensor,
+    pub qkv_bias: Option<Tensor>,
+    pub q_norm: Option<Tensor>,
+    pub k_norm: Option<Tensor>,
+    pub o: Tensor,
+    pub post_norm: Tensor,
+    pub gate_up: Tensor,
+    pub down: Tensor,
+}
+
 pub struct TransformerBlock {
     input_layernorm: RmsNorm,
     self_attn: GroupedQueryAttention,
@@ -79,6 +98,29 @@ impl TransformerBlock {
     /// Clear the attention KV-cache.
     pub fn clear_cache(&mut self) {
         self.self_attn.clear_cache();
+    }
+
+    pub fn weights(&self) -> BlockWeights {
+        let (qkv, o, q_norm, k_norm) = self.self_attn.projections();
+        let (heads, kv_heads, head_dim) = self.self_attn.heads();
+        let (gate_up, down, intermediate) = self.mlp.projections();
+        BlockWeights {
+            hidden: o.weight().dim(0).unwrap_or(0),
+            intermediate,
+            heads,
+            kv_heads,
+            head_dim,
+            eps: self.input_layernorm.eps(),
+            input_norm: self.input_layernorm.weight().clone(),
+            qkv: qkv.weight().clone(),
+            qkv_bias: qkv.bias().cloned(),
+            q_norm: q_norm.map(|norm| norm.weight().clone()),
+            k_norm: k_norm.map(|norm| norm.weight().clone()),
+            o: o.weight().clone(),
+            post_norm: self.post_attention_layernorm.weight().clone(),
+            gate_up: gate_up.weight().clone(),
+            down: down.weight().clone(),
+        }
     }
 
     /// Snapshot the attention KV-cache for this layer.

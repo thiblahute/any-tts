@@ -24,6 +24,7 @@ use super::config::CodePredictorConfig;
 /// Code predictor sampling, from the generation_config.json of the model
 /// (subtalker_temperature; subtalker_top_k is 50 and subtalker_top_p 1.0).
 const SUBTALKER_TEMPERATURE: f64 = 0.9;
+const SUBTALKER_TOP_K: usize = 50;
 
 /// The Code Predictor sub-model.
 pub struct CodePredictor {
@@ -153,6 +154,54 @@ impl CodePredictor {
         }
     }
 
+    #[cfg(feature = "cuda")]
+    pub fn input_proj(&self) -> Option<&Linear> {
+        self.input_proj.as_ref()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn blocks(&self) -> impl Iterator<Item = &TransformerBlock> {
+        self.layers.iter()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn norm_weight(&self) -> &Tensor {
+        self.norm.weight()
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn rope(&self) -> (&Tensor, &Tensor) {
+        (&self.rope_cos, &self.rope_sin)
+    }
+
+    /// The heads of groups 1..N-1, in order.
+    #[cfg(feature = "cuda")]
+    pub fn head_weights(&self) -> impl Iterator<Item = &Tensor> {
+        self.group_heads.iter().map(Linear::weight)
+    }
+
+    /// The embeddings of groups 1..N-1, in order, in the talker's space.
+    #[cfg(feature = "cuda")]
+    pub fn group_embeddings(&self) -> impl Iterator<Item = &Tensor> {
+        self.group_embeds.iter().map(Embedding::embeddings)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    /// How the groups are sampled: temperature and top k.
+    #[cfg(feature = "cuda")]
+    pub fn temperature(&self) -> f64 {
+        SUBTALKER_TEMPERATURE
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn top_k(&self) -> usize {
+        SUBTALKER_TOP_K
+    }
+
     /// Embed codes of codebook `group` (1..N-1) in the talker's hidden space.
     pub fn embed_group(&self, group: usize, token_ids: &Tensor) -> Result<Tensor> {
         self.group_embeds[group - 1].forward(token_ids)
@@ -228,7 +277,8 @@ impl CodePredictor {
         let logits = self.group_heads[0].forward(&last_h)?;
         // Sampled on the GPU: the code stays there as the next step's input,
         // and the frame's codes reach the CPU once, at its end.
-        let mut prev_predicted_token = sample_top_k_top_p_gpu(&logits, SUBTALKER_TEMPERATURE, 50, 1.0)?; // (1,) u32
+        let mut prev_predicted_token =
+            sample_top_k_top_p_gpu(&logits, SUBTALKER_TEMPERATURE, SUBTALKER_TOP_K, 1.0)?; // (1,) u32
         let mut predicted: Vec<Tensor> = Vec::with_capacity(num_extra_groups);
         predicted.push(prev_predicted_token.clone());
 
@@ -254,7 +304,8 @@ impl CodePredictor {
             let h = self.norm.forward(&h)?;
 
             let logits = self.group_heads[gen_step].forward(&h)?;
-            let predicted_token = sample_top_k_top_p_gpu(&logits, SUBTALKER_TEMPERATURE, 50, 1.0)?;
+            let predicted_token =
+                sample_top_k_top_p_gpu(&logits, SUBTALKER_TEMPERATURE, SUBTALKER_TOP_K, 1.0)?;
             predicted.push(predicted_token.clone());
 
             // Embed and add to sum
