@@ -84,10 +84,21 @@ impl DeviceSelection {
 }
 
 /// Attempt to create a CUDA device.
+///
+/// It runs everything on one stream of its own rather than the legacy
+/// default stream, which cannot be captured into a CUDA graph. With a
+/// single stream, the cross-stream events cudarc otherwise creates,
+/// records and waits for around every allocation and kernel launch (the
+/// bulk of the host time of a decoding step) order nothing, so they are
+/// turned off before any tensor exists.
 fn new_cuda(ordinal: usize) -> candle_core::Result<Device> {
     #[cfg(feature = "cuda")]
     {
-        let device = Device::new_cuda(ordinal)?;
+        let device = Device::new_cuda_with_stream(ordinal)?;
+        if let Device::Cuda(cuda) = &device {
+            // SAFETY: every tensor of this device lives on its one stream.
+            unsafe { cuda.disable_event_tracking() };
+        }
         info!("CUDA device {} initialized", ordinal);
         Ok(device)
     }
@@ -122,7 +133,7 @@ fn auto_select() -> candle_core::Result<Device> {
     // Try CUDA first
     #[cfg(feature = "cuda")]
     {
-        match Device::new_cuda(0) {
+        match new_cuda(0) {
             Ok(device) => {
                 info!("Auto-selected CUDA device 0");
                 return Ok(device);
