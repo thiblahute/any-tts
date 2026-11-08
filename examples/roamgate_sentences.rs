@@ -59,10 +59,18 @@ fn main() -> anyhow::Result<()> {
         let mut samples = Vec::new();
         let mut rate = 24_000;
         let mut chunks = 0;
+        // How long before playback (from the first audio on) runs out each
+        // chunk came: negative would be a gap in the audio.
+        let mut slack_ms = f64::INFINITY;
         model.synthesize_stream(&request, &mut |chunk| {
             chunks += 1;
             if !chunk.samples.is_empty() {
-                first_audio_ms.get_or_insert(started.elapsed().as_secs_f64() * 1000.0);
+                let now = started.elapsed().as_secs_f64() * 1000.0;
+                let first = *first_audio_ms.get_or_insert(now);
+                let played = samples.len() as f64 * 1000.0 / chunk.sample_rate as f64;
+                if !samples.is_empty() {
+                    slack_ms = slack_ms.min(first + played - now);
+                }
                 rate = chunk.sample_rate;
                 samples.extend_from_slice(&chunk.samples);
             }
@@ -77,7 +85,7 @@ fn main() -> anyhow::Result<()> {
         let frames = audio.samples.len() / 1920;
         println!(
             "{:02} {lang} first audio {:.0} ms, total {:.0} ms, audio {:.1} s, RTF {:.3}, \
-             {frames} frames, {:.1} ms/frame, {chunks} chunks: {}",
+             {frames} frames, {:.1} ms/frame, {chunks} chunks, slack {slack_ms:.0} ms: {}",
             index + 1,
             first_audio_ms.unwrap_or(0.0),
             total * 1000.0,

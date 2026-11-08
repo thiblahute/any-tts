@@ -258,8 +258,9 @@ impl TtsModel for Qwen3TtsModel {
         request: &SynthesisRequest,
         on_chunk: &mut dyn FnMut(AudioSamples) -> Result<(), TtsError>,
     ) -> Result<(), TtsError> {
-        // The first chunk is short so that audio starts early; later ones
-        // grow, each decode having a fixed cost, once playback is covered.
+        // The first chunk is short so that audio starts early (see
+        // `first_chunk_due`); later ones grow, each decode having a fixed
+        // cost, once playback is covered.
         const CHUNKS: [usize; 3] = [4, 8, 25];
 
         self.validate_request(request)?;
@@ -288,10 +289,16 @@ impl TtsModel for Qwen3TtsModel {
                 .map_err(TtsError::ComputeError)?;
             on_chunk(AudioSamples::new(audio, 24000))
         };
+        let mut first_frame = None;
         let mut on_frame = |g0: u32, groups: &[u32]| -> candle_core::Result<()> {
             pending.push((g0, groups.to_vec()));
-            let due = CHUNKS[chunks.min(CHUNKS.len() - 1)];
-            if pending.len() >= due {
+            let due = if chunks == 0 {
+                let since = *first_frame.get_or_insert_with(std::time::Instant::now);
+                first_chunk_due(pending.len(), CHUNKS[0], since.elapsed())
+            } else {
+                pending.len() >= CHUNKS[chunks.min(CHUNKS.len() - 1)]
+            };
+            if due {
                 if let Err(error) = decode(&pending, &mut stream) {
                     let message = error.to_string();
                     failure = Some(error);
@@ -1126,6 +1133,15 @@ impl Qwen3TtsModel {
 }
 
 /// Identifies a voice embedding, to reuse its prepared form.
+/// Whether the first `frames` of a stream make its first chunk, the first
+/// frame having come `since_first` ago. Fewer than `chunk` when they come
+/// fast enough that the next chunk, of 8, is decoded before they have
+/// played (80 ms each): 2 frames when each takes 15 ms or less, 3 under 20.
+fn first_chunk_due(frames: usize, chunk: usize, since_first: std::time::Duration) -> bool {
+    let pace = since_first.as_secs_f64() * 1000.0 / frames.saturating_sub(1).max(1) as f64;
+    frames >= chunk || (frames == 2 && pace <= 15.0) || (frames == 3 && pace <= 20.0)
+}
+
 fn voice_key(embedding: &VoiceEmbedding) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for value in embedding.data() {
