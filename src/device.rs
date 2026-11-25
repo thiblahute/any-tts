@@ -94,7 +94,18 @@ impl DeviceSelection {
 fn new_cuda(ordinal: usize) -> candle_core::Result<Device> {
     #[cfg(feature = "cuda")]
     {
-        let device = Device::new_cuda_with_stream(ordinal)?;
+        // Candle may load the CUDA libraries at run time (cudarc's
+        // dynamic-loading), and cudarc panics when the driver or a library
+        // is missing: that is no CUDA here, not a crash.
+        let device = std::panic::catch_unwind(|| Device::new_cuda_with_stream(ordinal))
+            .map_err(|panic| {
+                let reason = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("the CUDA libraries did not load");
+                candle_core::Error::Msg(format!("CUDA is not available: {reason}"))
+            })??;
         if let Device::Cuda(cuda) = &device {
             // SAFETY: every tensor of this device lives on its one stream.
             unsafe { cuda.disable_event_tracking() };
